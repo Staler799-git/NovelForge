@@ -2,11 +2,35 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>method</key>
-  <string>ad-hoc</string>
-  <key>teamID</key>
-  <string>$TEAM_ID</string>
-  <key>thinning</key>
-  <string><none></string>
+	<!--
+	  POZOR: Tento soubor NENÍ použit workflow "ios-device-unsigned".
+
+	  Unsigned IPA pro Signulous se nevytváří přes `xcodebuild -exportArchive`
+	  (ten vyžaduje podepsaný archiv a platné provisioning profile), ale ručním
+	  zabalením Payload/App.app do ZIPu – viz scripts/build-ios-unsigned.sh.
+
+	  Tento plist slouží pouze pro PŘÍPADNÝ podepsaný export (vývojář s Apple
+	  Developer účtem), kdy doplníte vlastní TEAM_ID a certifikát:
+
+	    xcodebuild -exportArchive \
+	      -archivePath build/App.xcarchive \
+	      -exportOptionsPlist export-options.plist \
+	      -exportPath build/ipa
+
+	  Hodnota "development" = podpis pro vlastní zařízení (ad-hoc náhrada).
+	-->
+	<key>method</key>
+	<string>development</string>
+	<!-- Doplňte své 10místné Team ID, jinak export podepsané IPA selže. -->
+	<key>teamID</key>
+	<string>YOUR_TEAM_ID</string>
+	<key>signingStyle</key>
+	<string>automatic</string>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>compileBitcode</key>
+	<false/>
+	<key>thinning</key>
+	<string>&lt;none&gt;</string>
 </dict>
 </plist>

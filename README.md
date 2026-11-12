@@ -26,8 +26,11 @@ NovelForge je plně funkční iOS aplikace pro převod web novel (online román�
 ```
 NovelForge/
 ├── capacitor.config.ts      # Konfigurace Capacitoru (appId com.novelforge.app)
-├── codemagic.yaml           # Sestavení IPA pro Signulous
-├── export-options.plist     # Možnosti exportu archivu (ad-hoc)
+├── codemagic.yaml           # Workflow ios-device-unsigned → unsigned IPA + ZIP pro Signulous
+├── export-options.plist     # Pouze pro volitelný PODEPSANÝ export (workflow jej nepoužívá)
+├── scripts/
+│   ├── build-ios-unsigned.sh    # xcodebuild → Payload/App.app → IPA → ZIP + verifikace
+│   └── patch-ios-plugins.mjs    # registrace lokálního Swift pluginu do capacitor.config.json
 ├── package.json, tsconfig.json, vite.config.ts, tailwind.config.js
 ├── index.html
 ├── src/
@@ -117,34 +120,68 @@ Výchozí souběžnost požadavků (1-10), prodleva mezi požadavky (ms) a maxim
 
 1. **Živé testování wuxiabox.com nebylo v tomto prostředí možné** (sandbox povoluje odchozí spojení pouze na github.com a npm registry). Selektory v `wuxiabox.ts` vycházejí z běžné struktury web-novelových katalogů a budou vyžadovat odladění proti skutečnému webu. Pokud detekce selže, aplikace automaticky použije `GenericNovelParser` a nabídne ruční výběr odkazů. Automatické testy jsou sestaveny s uloženými HTML fixatury.
 2. **Stahování na pozadí**: iOS neposkytuje neomezené background stahování bez speciálních oprávnění. NovelForge nepoukazuje na nepřerušitelné běhání na pozadí – doporučuje se nechat aplikaci spuštěnou. Resume funguje spolehlivě po restartu i uzavření aplikace.
-3. **Signulous**: instalace IPA přes Signulous nevyžaduje jailbreak. Vyžaduje však platný vývojářský/distribuční účet Apple pro sestavení podepsaného archivu v Codemagic (viz níže).
+3. **Signulous**: instalace IPA přes Signulous nevyžaduje jailbreak ani Apple Developer účet. Codemagic sestaví **nepodepsanou** IPA (`ios-device-unsigned`), podpis provede Signulous (viz níže).
 4. **DRM / placený obsah / CAPTCHA**: aplikace tyto ochrany neobchází. Stahuje pouze volně přístupný obsah.
 
 ## 5. Postup sestavení a instalace
 
 ### Lokálně (macOS + Xcode)
 ```bash
-cd /home/user/NovelForge   # (ve vašem macOS pracovním adresáři)
-npm install --legacy-peer-deps
+cd /cesta/k/NovelForge      # (ve vašem macOS pracovním adresáři)
+npm ci                    # Capacitor 8 – všechny balíčky na jedné major verzi
 npm run build             # Vite sestavení do dist/
-npx cap sync ios          # zkopíruje web do ios/App
+npm run ios:sync          # cap sync ios + registrace lokálního WebRenderer pluginu
+(cd ios/App && pod install)
 npx cap open ios          # otevře Xcode
 ```
 V Xcode vyberte схему `App`, cíl váš iPhone (fyzické zařízení; simulátor nelze pro finální IPA), připojte podepsání (Apple ID / vývojářský certifikát) a sestavte: **Product → Archive → Distribute App → Ad Hoc** (nebo Development pro osobní použití).
 
-### Přes Codemagic (doporučeno pro Signulous)
-1. Nahrajte repozitář na GitHub.
-2. V Codemagic vytvořte novou aplikaci, vyberte tento repozitář a soubor `codemagic.yaml`.
-3. Nastavte proměnné prostředí: `TEAM_ID` (váš Apple Team ID). Pro podepsání potřebujete v Codemagic nahrát distribční certifikát a provisioning profil (App Store nebo Ad Hoc).
-4. Spusťte build – výstupem je `NovelForge.ipa` (artefakt buildu).
+### Přes Codemagic – UNSIGNED IPA pro Signulous (bez Apple Developer účtu)
+Workflow **`ios-device-unsigned`** (název v UI: „NovelForge – iOS IPA for Signulous“) sestaví
+skutečnou aplikaci pro fyzický iPhone **bez jakéhokoli podpisu**. Nepotřebujete Apple Developer
+účet, App Store Connect, TestFlight, certifikáty ani provisioning profily – podpis provádí až Signulous.
+
+1. Nahrajte repozitář na GitHub (větev `main`).
+2. Codemagic → **Add application** → vyberte `Staler799-git/NovelForge` → zvolte **Codemagic YAML**
+   (soubor `codemagic.yaml` je v kořeni a je zdrojem konfigurace).
+3. **Nenastavujte** žádné proměnné prostředí, certifikáty ani integrace App Store Connect.
+4. Spusťte build: **Start new build** → branch `main` → workflow **`ios-device-unsigned`**.
+   Build jde také spustit automaticky po pushi do `main` (`triggering` v `codemagic.yaml`).
+5. Po dokončení otevřete **Artifacts**:
+   - `NovelForge-Signulous.zip` ← hlavní soubor ke stažení (obsahuje `NovelForge.ipa`)
+   - `NovelForge.ipa` ← samostatná IPA jako záloha
+
+Workflow běží na macOS stroji (Xcode 26.x, Node 22, CocoaPods 1.16), provede `npm ci`,
+`tsc --noEmit`, `vitest`, `vite build`, `npx cap sync ios`, `pod install`,
+`xcodebuild -sdk iphoneos -destination generic/platform=iOS` s vypnutým podpisem,
+zabalí `Payload/App.app` do `NovelForge.ipa`, ověří ji (platný ZIP, arm64, žádná simulátorová
+architektura, frameworky, webové prostředky, Bundle ID) a vytvoří `NovelForge-Signulous.zip`.
+Jakákoli chyba v kterékoliv z těchto kontrol ukončí build jako **FAILED**.
+
+Lokálně lze stejnou logiku spustit na macOS:
+```bash
+npm ci && npm run build && npm run ios:sync
+cd ios/App && pod install && cd ../..
+npm run ios:build:unsigned      # → artifacts/NovelForge.ipa + artifacts/NovelForge-Signulous.zip
+```
 
 ### Instalace přes Signulous (bez jailbreaku)
-1. Stáhněte `NovelForge.ipa` z artefaktů Codemagic buildu.
-2. V webovém rozhraní Signulous nahrajte .ipa soubor.
-3. Signulous soubor znovu podepře swoim enterprise certifikátem.
-4. Nainstalujte upravený .ipa do iPhonu přes Safari (odkaz od Signulous) nebo přes configurator. Není nutný jailbreak, není nutný App Store.
+1. V Codemagic otevřete build → **Artifacts** → stáhněte `NovelForge-Signulous.zip`.
+2. V aplikaci **Soubory** na iPhonu klepněte na ZIP – rozbalí se `NovelForge.ipa`.
+3. Nahrajte `NovelForge.ipa` do Signulous (Upload IPA).
+4. Signulous aplikaci podepíše svým certifikátem a nabídne instalaci.
+5. Nainstalujte ji na iPhone (Safari odkaz od Signulous). Není nutný jailbreak ani App Store.
 
 > Poznámka: Signulous vyžaduje vlastní předplatné/signovací certifikát Signulous; NovelForge si jej neposkytuje.
+> Úspěšné sestavení IPA ≠ úspěšná instalace: podpis řeší Signulous a může selhat (např. při vyčerpaném
+> limitu zařízení). Aplikace **nepoužívá žádné entitlements** (bez push, bez iCloud, bez App Groups),
+> takže podpis přes Signulous je bez konfliktů. Info.plist obsahuje `ITSAppUsesNonExemptEncryption=false`.
+
+### Ověření iOS buildu
+iOS build **nebyl v tomto prostředí ověřen** – sandbox je Linux bez Xcode a CocoaPods.
+Ověřeno bylo: `npm ci`, TypeScript, vitest, `vite build`, `npx cap sync ios`, syntaktická validita
+`codemagic.yaml`, konzistence Podfile/podspec názvů a logika balení IPA/ZIP (testována na simulovaném
+`.app`). První skutečný Xcode build proběhne v Codemagic.
 
 ## 6. Testy
 
