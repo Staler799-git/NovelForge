@@ -139,7 +139,7 @@ FRAMEWORK_COUNT="$(find "${APP_PATH}/Frameworks" -maxdepth 1 -name '*.framework'
 [ "${FRAMEWORK_COUNT:-0}" -gt 0 ] || fail "Aplikace neobsahuje žádné frameworky (Capacitor/Pods se neembedovaly)."
 # Pod názvy = názvy frameworků, které musí být v Payload/App.app/Frameworks.
 for required in Capacitor CapacitorCordova CapacitorCommunitySqlite CapacitorApp CapacitorFilesystem CapacitorShare; do
-  find "${APP_PATH}/Frameworks" -maxdepth 1 -name "${required}.framework" | grep -q . \
+  [ -d "${APP_PATH}/Frameworks/${required}.framework" ] \
     || fail "Chybí framework ${required}.framework v ${APP_PATH}/Frameworks"
 done
 ok "Frameworky: ${FRAMEWORK_COUNT} (Capacitor, CapacitorCordova, CapacitorCommunitySqlite a další pluginy přítomny)"
@@ -174,9 +174,19 @@ ok "Vytvořeno: $IPA_PATH ($(du -h "$IPA_PATH" | cut -f1))"
 # ---------------------------------------------------------------- verify the IPA
 log "Ověření integrity IPA"
 unzip -tq "$IPA_PATH" >/dev/null || fail "IPA není platný ZIP archiv."
-unzip -l "$IPA_PATH" | grep -q "Payload/App.app/Info.plist" || fail "IPA neobsahuje Payload/App.app/Info.plist."
-unzip -l "$IPA_PATH" | grep -qE "Payload/App.app/${EXECUTABLE_NAME}\$" || fail "IPA neobsahuje spustitelný binární soubor Payload/App.app/${EXECUTABLE_NAME}."
-unzip -l "$IPA_PATH" | grep -q "Payload/App.app/public/index.html" || fail "IPA neobsahuje webové prostředky."
+
+# POZOR: výpis se načte JEDNOU do proměnné. Dřívější varianta
+#   unzip -l "$IPA" | grep -q "..."  || fail "..."
+# byla zrádná: u velké IPA (20 000+ záznamů) `grep -q` narazí hned na začátku,
+# ukončí se a `unzip` dostane SIGPIPE (141). Se `set -o pipefail` je pak celá
+# pipeline 141 → `|| fail` → build spadne, i když soubor v IPA JE.
+IPA_LISTING="$(unzip -Z1 "$IPA_PATH")"
+grep -qxF "Payload/App.app/Info.plist" <<< "$IPA_LISTING" \
+  || fail "IPA neobsahuje Payload/App.app/Info.plist."
+grep -qxF "Payload/App.app/${EXECUTABLE_NAME}" <<< "$IPA_LISTING" \
+  || fail "IPA neobsahuje spustitelný binární soubor Payload/App.app/${EXECUTABLE_NAME}."
+grep -qxF "Payload/App.app/public/index.html" <<< "$IPA_LISTING" \
+  || fail "IPA neobsahuje webové prostředky."
 ok "IPA je platný archiv se všemi potřebnými soubory"
 
 # ---------------------------------------------------------------- ZIP for Signulous
