@@ -1,55 +1,228 @@
-# Codemagic CI/CD konfigurace pro NovelForge (iOS IPA)
-# Postup: nahrajte tento soubor do kořene repozitáře, připojte GitHub repo
-# v Codemagic a spusťte build. Výsledkem je .ipa soubor připravený k instalaci
-# přes Signulous.
+# =============================================================================
+# NovelForge – Codemagic CI/CD konfigurace
+# =============================================================================
+#
+# Workflow: ios-device-unsigned
+#   Název v Codemagic UI: "NovelForge – iOS IPA for Signulous"
+#
+# Sestaví skutečnou iOS aplikaci pro fyzický iPhone (generic/platform=iOS,
+# iPhoneOS SDK, arm64), ZCELA BEZ PODPISU, zabalí ji do NovelForge.ipa a tu do
+# NovelForge-Signulous.zip. Podpis provádí až Signulous – tento workflow
+# NEPOUŽÍVÁ Apple Developer účet, App Store Connect, TestFlight, certifikáty
+# ani provisioning profiles, a neposílá e-mailové notifikace.
+#
+# Artefakty (Codemagic → Artifacts):
+#   artifacts/NovelForge-Signulous.zip   ← hlavní soubor ke stažení (obsahuje IPA)
+#   artifacts/NovelForge.ipa             ← samostatná IPA jako záloha
+#   artifacts/build-info.txt             ← Bundle ID, verze, architektury
+#   build/xcodebuild.log                 ← log pro diagnostiku
+#
+# Workflow: novelforge-web-tests (volitelný)
+#   Rychlá kontrola webové části (npm ci / tsc / vite build / vitest) na Linuxu.
+#
+# Manuální spuštění: Codemagic → Start new build → branch main → vybrat workflow.
+# Automatický build: triggering.events: push, branch_patterns: main.
+#
+# POZNÁMKA: Hodnoty jsou záměrně vypsané přímo (bez YAML merge keys `<<`),
+# aby konfigurace nezávisela na tom, jaký YAML parser Codemagic používá.
+# =============================================================================
 
 workflows:
-  novelforge-ios:
-    name: NovelForge – iOS IPA (Release)
+  # ===========================================================================
+  # HLAVNÍ WORKFLOW – unsigned IPA pro Signulous
+  # ===========================================================================
+  ios-device-unsigned:
+    name: NovelForge – iOS IPA for Signulous
+    instance_type: mac_mini_m2
     max_build_duration: 120
+
     environment:
-      ios:
-        xcode: latest
-      node: latest
-      cocoapods: default
+      node: 22.22.1 # @capacitor/cli 8 vyžaduje Node >= 22
+      xcode: latest # aktuální oficiální Xcode na macOS stroji (Xcode 26.x)
+      cocoapods: default # CocoaPods předinstalovaný v imagi (1.16.x)
+      ruby: default
+      vars:
+        BUNDLE_ID: com.novelforge.app
+        XCODE_SCHEME: App
+        XCODE_WORKSPACE: ios/App/App.xcworkspace
+        XCODE_PROJECT: ios/App/App.xcodeproj
+        APP_VERSION: 1.0.0
+
+    cache:
+      cache_paths:
+        - $HOME/Library/Caches/CocoaPods
+        - $HOME/.npm
+
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+      cancel_previous_builds: true
+
     scripts:
-      - name: Nainstalovat JavaScript závislosti
+      - name: Ověřit prostředí (Xcode, Node, CocoaPods)
         script: |
-          npm install --legacy-peer-deps
-      - name: Sestavit webovou část (Vite)
+          set -e
+          echo "Xcode:"; xcodebuild -version
+          echo "Node: $(node -v)"; echo "npm: $(npm -v)"
+          echo "CocoaPods: $(pod --version)"
+          echo "Ruby: $(ruby -v)"
+          echo "Selected Xcode: $(xcode-select -p)"
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: Nainstalovat npm závislosti (npm ci)
         script: |
+          set -e
+          node -e "const v=process.versions.node.split('.').map(Number); if (v[0] < 22) { console.error('Node >= 22 is required, found '+process.version); process.exit(1); }"
+          npm ci --no-audit --no-fund
+          echo "--- Capacitor packages ---"
+          npm ls @capacitor/core @capacitor/cli @capacitor/ios --depth=0
+
+      - name: Statická kontrola TypeScriptu
+        script: |
+          set -e
+          npx tsc --noEmit
+
+      - name: Unit testy (vitest)
+        script: |
+          set -e
+          npm test
+
+      - name: Sestavit webovou část (Vite → dist/)
+        script: |
+          set -e
           npm run build
-      - name: Synchronizovat do nativního iOS projektu (Capacitor)
+          test -f dist/index.html || { echo "dist/index.html chybí"; exit 1; }
+          echo "Web build OK: $(du -sh dist | cut -f1)"
+
+      - name: Synchronizovat Capacitor iOS projekt
         script: |
-          npx cap sync ios
-      - name: Nainstalovat CocoaPods závislosti
+          set -e
+          npx cap sync ios --deployment
+          # Capacitor auto-registruje jen pluginy z node_modules. WebRenderer.swift
+          # je lokální plugin v tomto repu, doplníme ho do packageClassList.
+          node scripts/patch-ios-plugins.mjs
+          test -f ios/App/App/public/index.html || { echo "Web assets nebyly zkopírovány"; exit 1; }
+          grep -q '"WebRenderer"' ios/App/App/capacitor.config.json \
+            || { echo "WebRenderer plugin není zaregistrován v capacitor.config.json"; exit 1; }
+          echo "--- ios/App/App/capacitor.config.json ---"
+          cat ios/App/App/capacitor.config.json
+
+      - name: Instalace CocoaPods závislostí (pod install)
         script: |
-          cd ios && pod install && cd ..
-      - name: Sestavit Xcode archiv (Release, iOS device)
+          set -e
+          cd ios/App
+          pod --version
+          pod install --repo-update
+          test -f Pods/Manifest.lock || { echo "pod install neproběhl"; exit 1; }
+          test -f App.xcworkspace/contents.xcworkspacedata || { echo "xcworkspace je neplatný"; exit 1; }
+          echo "--- Nainstalované pod závislosti ---"
+          ls Pods | head -40
+          cd ../..
+
+      - name: Sestavit unsigned aplikaci pro fyzický iPhone
         script: |
-          xcodebuild -workspace ios/App/App.xcworkspace \
-            -scheme App \
+          set -e
+          # generic/platform=iOS + -sdk iphoneos => fyzické zařízení, nikoli simulátor.
+          xcodebuild \
+            -workspace "${XCODE_WORKSPACE:-ios/App/App.xcworkspace}" \
+            -scheme "${XCODE_SCHEME:-App}" \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath ./build/derived \
-            -archivePath ./build/Archive/App.xcarchive \
-            archive \
-            CODE_SIGN_STYLE=Automatic
-      - name: Exportovat IPA z archivu
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/derived \
+            -allowProvisioningUpdates=NO \
+            MARKETING_VERSION="${APP_VERSION:-1.0.0}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-1}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            DEVELOPMENT_TEAM="" \
+            build
+          test -d build/derived/Build/Products/Release-iphoneos/App.app \
+            || { echo "App.app nebyl vytvořen"; exit 1; }
+
+      - name: Vytvořit IPA, ZIP a ověřit integritu
         script: |
-          mkdir -p ./build/ipa
-          xcodebuild -exportArchive \
-            -archivePath ./build/Archive/App.xcarchive \
-            -exportOptionsPlist ./export-options.plist \
-            -exportPath ./build/ipa
-      - name: Připravit artefakty
+          set -e
+          # Skript ověří IPA i ZIP; při jakékoli chybě skončí exit 1 => build FAILED.
+          bash scripts/build-ios-unsigned.sh
+
+      - name: Souhrn artefaktů
         script: |
-          cp ./build/ipa/App.ipa ./NovelForge.ipa
-          ls -la ./NovelForge.ipa
+          set -e
+          echo "=== ARTEFAKTY ==="
+          ls -la artifacts/
+          echo
+          echo "=== OBSAH ZIPu ==="
+          unzip -l artifacts/NovelForge-Signulous.zip
+          echo
+          echo "=== OBSAH IPA (prvních 40 záznamů) ==="
+          unzip -l artifacts/NovelForge.ipa | head -40
+          echo
+          echo "=== ARCHITEKTURY BINÁRKY ==="
+          lipo -archs build/derived/Build/Products/Release-iphoneos/App.app/App
+          echo
+          echo "=== INFO ==="
+          cat artifacts/build-info.txt
+          echo
+          echo "=== SHA256 ==="
+          shasum -a 256 artifacts/NovelForge.ipa artifacts/NovelForge-Signulous.zip
+
     artifacts:
-      - ./NovelForge.ipa
-      - ./build/derived/**/*.xccov*
-    publishing:
-      email:
-        recipients:
-          - $SENDER_EMAIL
+      - artifacts/NovelForge-Signulous.zip
+      - artifacts/NovelForge.ipa
+      - artifacts/build-info.txt
+      - build/xcodebuild.log
+      - build/derived/Build/Products/Release-iphoneos/App.app.dSYM
+
+  # ===========================================================================
+  # VOLITELNÝ WORKFLOW – rychlé testy webové části (bez macOS minut)
+  # ===========================================================================
+  novelforge-web-tests:
+    name: NovelForge – Web tests (no iOS build)
+    instance_type: linux_x2
+    max_build_duration: 30
+
+    environment:
+      node: 22.22.1
+
+    triggering:
+      events:
+        - pull_request
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: true
+          target: true
+
+    scripts:
+      - name: Instalace závislostí
+        script: |
+          set -e
+          npm ci --no-audit --no-fund
+
+      - name: TypeScript kontrola
+        script: |
+          set -e
+          npx tsc --noEmit
+
+      - name: Unit testy
+        script: |
+          set -e
+          npm test
+
+      - name: Produkční build
+        script: |
+          set -e
+          npm run build
+          test -f dist/index.html
+
+    artifacts:
+      - dist/**/*

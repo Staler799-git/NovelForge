@@ -46,4 +46,19 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         return ApplicationDelegateProxy.shared.application(application, continue: userActivity, restorationHandler: restorationHandler)
     }
 
+    // MARK: - UIScene lifecycle
+    //
+    // iOS 26 SDK requires every UIKit app to adopt the UIScene lifecycle, otherwise
+    // the app is terminated on launch with:
+    //   "UIScene life cycle is required for apps built with this SDK".
+    // Capacitor 8's own template ships SceneDelegate.swift for this reason.
+    func application(_ application: UIApplication,
+                     configurationForConnecting connectingSceneSession: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+
+        let config = UISceneConfiguration(name: "Default Configuration", sessionRole: connectingSceneSession.role)
+        config.delegateClass = SceneDelegate.self
+        return config
+    }
+
 }
