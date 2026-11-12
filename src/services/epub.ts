@@ -1,3 +1,4 @@
+import { parseHtml } from "./html";
 import JSZip from "jszip";
 import { db } from "./db";
 import { storage } from "@/services/storage";
@@ -40,7 +41,7 @@ function bodyTextFromFile(html: string): string {
  */
 export function chapterBodyFromFile(html: string): string {
   // <head> se zahazuje: stačí tělo a parser nemá důvod sahat na styly.
-  const doc = new DOMParser().parseFromString(html.replace(/^<\?xml[^>]*\?>/, "").replace(/<head[\s>][\s\S]*?<\/head>/i, ""), "text/html");
+  const doc = parseHtml(html.replace(/^<\?xml[^>]*\?>/, "").replace(/<head[\s>][\s\S]*?<\/head>/i, ""));
   const body = doc.querySelector(".chapter-body");
   if (body) return sanitizeToXhtml(body.innerHTML);
   for (const el of Array.from(doc.querySelectorAll("header.chapter-header"))) el.remove();
