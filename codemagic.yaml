@@ -106,7 +106,11 @@ workflows:
       - name: Synchronizovat Capacitor iOS projekt
         script: |
           set -e
-          npx cap sync ios --deployment
+          # POZOR: bez --deployment. Capacitor CLI předává --deployment do
+          # `pod install --deployment`, a ten vyžaduje commitnutý Podfile.lock.
+          # Ten v repu není (je v .gitignore), takže build padá na:
+          #   [!] There were changes to the podfile in deployment mode
+          npx cap sync ios
           # Capacitor auto-registruje jen pluginy z node_modules. WebRenderer.swift
           # je lokální plugin v tomto repu, doplníme ho do packageClassList.
           node scripts/patch-ios-plugins.mjs
@@ -116,12 +120,20 @@ workflows:
           echo "--- ios/App/App/capacitor.config.json ---"
           cat ios/App/App/capacitor.config.json
 
-      - name: Instalace CocoaPods závislostí (pod install)
+      - name: Ověřit CocoaPods závislosti
         script: |
           set -e
           cd ios/App
           pod --version
-          pod install --repo-update
+          # `npx cap sync ios` už `pod install` spustil (Capacitor CLI to dělá sám).
+          # Tady jen ověříme výsledek; --repo-update je záložní větev pro případ,
+          # že lockfile chybí (první běh, změna Podfile).
+          if [ ! -f Podfile.lock ] || [ ! -f Pods/Manifest.lock ]; then
+            echo "Podfile.lock/Manifest.lock chybí – spouštím pod install --repo-update"
+            pod install --repo-update
+          else
+            echo "CocoaPods závislosti už jsou nainstalované (z cap sync)."
+          fi
           test -f Pods/Manifest.lock || { echo "pod install neproběhl"; exit 1; }
           test -f App.xcworkspace/contents.xcworkspacedata || { echo "xcworkspace je neplatný"; exit 1; }
           echo "--- Nainstalované pod závislosti ---"
