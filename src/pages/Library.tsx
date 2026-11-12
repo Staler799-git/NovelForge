@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { db } from "@/services/db";
 import { projectStore } from "@/store";
 import type { Project } from "@/types";
-import { Card, Button, Badge, ProgressBar } from "@/components/ui";
+import { Card, Button, Badge, ProgressBar, Cover } from "@/components/ui";
 import { formatDateShort } from "@/lib/utils";
 import { BookOpen, RefreshCw, Share2, EllipsisVertical } from "lucide-react";
 
@@ -38,7 +38,7 @@ export function Library() {
     <div className="p-4 space-y-5 max-w-[700px] mx-auto">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">Knihovna</h1>
+          <h1 className="text-[28px] font-bold tracking-tight text-white leading-tight">Knihovna</h1>
           <p className="text-white/60">Vaše stažené projekty připravené k exportu.</p>
         </div>
         {loading ? (
@@ -64,7 +64,7 @@ export function Library() {
               <div className="p-4">
                 <div className="flex items-center gap-4">
                   {p.coverPath ? (
-                    <img src={`capacitor://${p.coverPath}`} alt="" className="w-20 h-28 rounded-xl object-cover bg-white/5" />
+                    <Cover coverPath={p.coverPath} className="w-20 h-28" />
                   ) : (
                     <div className="w-20 h-28 rounded-xl bg-white/5 flex items-center justify-center text-white/20">
                       <BookOpen size={22} />

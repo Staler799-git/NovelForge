@@ -4,7 +4,7 @@ import { db } from "@/services/db";
 import { downloadManager } from "@/services/downloader";
 import { projectStore } from "@/store";
 import type { Project } from "@/types";
-import { Card, SectionTitle, Button, Badge, ProgressBar } from "@/components/ui";
+import { Card, SectionTitle, Button, Badge, ProgressBar, Cover } from "@/components/ui";
 import { formatDateShort } from "@/lib/utils";
 import { Download, Pause, Play, RefreshCw, Trash2, Share2, FileText, Clock } from "lucide-react";
 
@@ -46,7 +46,7 @@ export function Downloads() {
     <div className="p-4 space-y-5 max-w-[700px] mx-auto">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">Správce stahování</h1>
+          <h1 className="text-[28px] font-bold tracking-tight text-white leading-tight">Stahování</h1>
           <p className="text-white/60">Průběh, opakování chyb a obnovení po přerušení.</p>
         </div>
         <Button variant="ghost" onClick={load}>
@@ -85,7 +85,7 @@ export function Downloads() {
               <div className="p-4">
                 <div className="flex items-center gap-3 mb-3">
                   {p.coverPath ? (
-                    <img src={`capacitor://${p.coverPath}`} alt="" className="w-14 h-20 rounded-xl object-cover bg-white/5" />
+                    <Cover coverPath={p.coverPath} className="w-14 h-20" />
                   ) : (
                     <div className="w-14 h-20 rounded-xl bg-white/5 flex items-center justify-center text-white/20">
                       <FileText size={20} />

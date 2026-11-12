@@ -7,7 +7,7 @@ import { Filesystem, Directory } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
 import { Haptics, ImpactStyle } from "@capacitor/haptics";
 import type { Project } from "@/types";
-import { Card, SectionTitle, Button, Input, Textarea, ProgressBar } from "@/components/ui";
+import { Card, SectionTitle, Button, Input, Textarea, ProgressBar, Cover } from "@/components/ui";
 import { Image as ImageIcon, RotateCw, Share as ShareIcon, FileText, Download as DownloadIcon } from "lucide-react";
 
 type SplitMode = "single" | "chapters" | "range";
@@ -141,7 +141,7 @@ export function EpubExport() {
   return (
     <div className="p-4 space-y-5 max-w-[640px] mx-auto">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-white">Export knihy</h1>
+        <h1 className="text-[28px] font-bold tracking-tight text-white leading-tight">Export knihy</h1>
         <p className="text-white/60 text-sm">Jediný EPUB obsahující všechny vybrané kapitoly.</p>
       </div>
 
@@ -155,7 +155,7 @@ export function EpubExport() {
                   {coverBase64 ? (
                     <img src={`data:${coverMime};base64,${coverBase64}`} alt="" className="w-32 h-44 rounded-xl object-cover bg-white/5 border border-white/10" />
                   ) : project.coverPath ? (
-                    <img src={`capacitor://${project.coverPath}`} alt="" className="w-32 h-44 rounded-xl object-cover bg-white/5 border border-white/10" />
+                    <Cover coverPath={project.coverPath} className="w-32 h-44 border border-white/10" />
                   ) : (
                     <div className="w-32 h-44 rounded-xl bg-white/5 flex items-center justify-center text-white/20 border border-white/10">
                       <ImageIcon size={24} />

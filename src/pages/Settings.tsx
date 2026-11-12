@@ -40,7 +40,7 @@ export function Settings() {
 
   return (
     <div className="p-4 space-y-5 max-w-[560px] mx-auto">
-      <h1 className="text-2xl font-bold text-white">Nastavení</h1>
+      <h1 className="text-[28px] font-bold tracking-tight text-white leading-tight">Nastavení</h1>
 
       <Card>
         <SectionTitle>Výchozí chování stahování</SectionTitle>

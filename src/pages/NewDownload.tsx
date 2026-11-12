@@ -194,7 +194,7 @@ export function NewDownload() {
                   </Button>
                   <Badge variant="muted">Vybráno: {selected.size} / {chapters.length}</Badge>
                 </div>
-                <div className="max-h-[320px] overflow-y-auto space-y-1 p-1 bg-white/3 rounded-xl">
+                <div className="max-h-[320px] overflow-y-auto space-y-1 p-1 bg-white/[0.03] rounded-xl">
                   {chapters.map((c) => (
                     <label key={c.url} className="flex items-center justify-between p-2 rounded-lg cursor-pointer transition hover:bg-white/5 group">
                       <input

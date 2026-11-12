@@ -4,7 +4,7 @@ import { db } from "@/services/db";
 import { downloadManager } from "@/services/downloader";
 import { projectStore } from "@/store";
 import type { Project, Chapter } from "@/types";
-import { Card, SectionTitle, Button, Badge, ProgressBar } from "@/components/ui";
+import { Card, SectionTitle, Button, Badge, ProgressBar, Cover } from "@/components/ui";
 import { List, Pause, Play, RefreshCw, Share2, AlertCircle, Clock } from "lucide-react";
 
 export function ProjectDetail() {
@@ -70,14 +70,14 @@ export function ProjectDetail() {
         <div className="p-5">
           <div className="flex gap-4">
             {project.coverPath ? (
-              <img src={`capacitor://${project.coverPath}`} alt="" className="w-32 h-44 rounded-2xl object-cover bg-white/5" />
+              <Cover coverPath={project.coverPath} className="w-32 h-44 rounded-2xl" />
             ) : (
               <div className="w-32 h-44 rounded-2xl bg-white/5 flex items-center justify-center text-white/20">
                 <List size={28} />
               </div>
             )}
             <div className="flex-1 min-w-0">
-              <h1 className="text-2xl font-bold text-white">{project.title}</h1>
+              <h1 className="text-[22px] font-bold tracking-tight text-white leading-snug line-clamp-3">{project.title}</h1>
               <p className="text-white/60 text-lg">{project.author}</p>
               <p className="mt-2 text-white/50">{project.description ?? "Bez popisu."}</p>
               <div className="mt-3 flex gap-2 text-xs text-white/40">
@@ -140,7 +140,7 @@ export function ProjectDetail() {
       </div>
 
       <SectionTitle>Kapitoly</SectionTitle>
-      <div className="max-h-[560px] overflow-y-auto border border-white/5 rounded-xl bg-white/3">
+      <div className="max-h-[560px] overflow-y-auto border border-white/5 rounded-xl bg-white/[0.03]">
         <table className="w-full text-left text-sm">
           <thead>
             <tr className="text-white/40 border-b border-white/5">

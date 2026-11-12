@@ -3,15 +3,94 @@
 @tailwind utilities;
 
 @layer base {
+  /* iOS: WebView musí mít tmavý podklad i mimo body, jinak při přetáhnutí
+     (rubber-band scroll) problikne bílá. */
   html {
     scroll-behavior: smooth;
+    background-color: #0a0a0b;
+    height: 100%;
+    -webkit-text-size-adjust: 100%;
   }
   body {
     @apply bg-dark-900 text-white antialiased selection:bg-pink-500 selection:text-white;
+    margin: 0;
+    min-height: 100%;
+    /* Zákaz označování textu při dlouhém stisku na tlačítkách – působí
+       nativněji a brání modrému zvýraznění. */
+    -webkit-tap-highlight-color: transparent;
+  }
+  #root {
+    min-height: 100%;
+    background-color: #0a0a0b;
+  }
+  /* Nativní pocit: žádné modré bílé záblesky u tlačítek */
+  button {
+    -webkit-tap-highlight-color: transparent;
+    font-family: inherit;
   }
 }
 
 @layer components {
+  /* Spodní navigace: pevně dole, s odsazením pro iOS Home Indicator.
+     Hodnota env(safe-area-inset-bottom) je 0 na zařízeních bez lišty a
+     ~34px na iPhone 16 Pro Max, takže se záložky nikdy nepřekrývají
+     s gesture barem. */
+  .tabbar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 50;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background-color: rgb(20 20 23 / 0.92);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border-top: 1px solid rgb(255 255 255 / 0.06);
+  }
+  .tabbar-inner {
+    display: flex;
+    align-items: stretch;
+    justify-content: space-around;
+    padding: 0.5rem 0.25rem 0.25rem;
+  }
+  .tab {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+    padding: 0.375rem 0.125rem;
+    border-radius: 0.9rem;
+    color: rgb(255 255 255 / 0.45);
+    transition: color 0.2s ease, background-color 0.2s ease, transform 0.15s ease;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .tab:active {
+    transform: scale(0.94);
+  }
+  .tab[data-active="true"] {
+    color: #f472b6;
+    background-color: rgb(236 72 153 / 0.12);
+  }
+  .tab-label {
+    font-size: 10px;
+    line-height: 1;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
+  /* Odsazení obsahu, aby poslední karty nezmizely pod navigací.
+     calc() kombinuje výšku lišty a safe area. */
+  .app-scroll {
+    padding-bottom: calc(4.75rem + env(safe-area-inset-bottom, 0px));
+    padding-top: env(safe-area-inset-top, 0px);
+  }
   .card {
     @apply bg-dark-800 rounded-2xl border border-white/5 overflow-hidden;
   }
@@ -22,7 +101,7 @@
     @apply inline-flex items-center justify-center gap-2 rounded-xl bg-white/5 px-4 py-2.5 text-sm font-medium text-white transition-all hover:bg-white/10 active:scale-95;
   }
   .input {
-    @apply w-full rounded-xl bg-white/4 border border-white/10 px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-transparent transition-all;
+    @apply w-full rounded-xl bg-white/5 border border-white/10 px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-transparent transition-all;
   }
   .section-title {
     @apply text-xl font-semibold tracking-tight text-white mb-4;

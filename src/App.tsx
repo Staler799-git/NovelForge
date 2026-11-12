@@ -80,16 +80,25 @@ function AppShell() {
 
   return (
     <div className="min-h-screen bg-dark-900 text-white">
+      {/*
+        app-scroll zajistí:
+          - padding-top = safe-area-inset-top (Dynamic Island / notch)
+          - padding-bottom = výška lišty + safe-area-inset-bottom (Home Indicator)
+        Bez toho poslední karty mizely pod spodní navigací a nadpisy zajížděly
+        pod Dynamic Island.
+      */}
+      <main className="app-scroll">
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/new" element={<NewDownload />} />
+          <Route path="/downloads" element={<Downloads />} />
+          <Route path="/library" element={<Library />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="/project/:id" element={<ProjectDetail />} />
+          <Route path="/project/:id/export" element={<EpubExport />} />
+        </Routes>
+      </main>
       <TabNavigator onTab={(to) => navigate(to)} />
-      <Routes>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/new" element={<NewDownload />} />
-        <Route path="/downloads" element={<Downloads />} />
-        <Route path="/library" element={<Library />} />
-        <Route path="/settings" element={<Settings />} />
-        <Route path="/project/:id" element={<ProjectDetail />} />
-        <Route path="/project/:id/export" element={<EpubExport />} />
-      </Routes>
     </div>
   );
 }

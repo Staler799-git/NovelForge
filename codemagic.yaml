@@ -46,7 +46,8 @@ workflows:
         XCODE_SCHEME: App
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_PROJECT: ios/App/App.xcodeproj
-        APP_VERSION: 1.0.0
+        # 1.1.0 = oprava Tailwind/UI. Číslo buildu roste s každým během.
+        APP_VERSION: 1.1.0
 
     cache:
       cache_paths:
@@ -99,9 +100,38 @@ workflows:
       - name: Sestavit webovou část (Vite → dist/)
         script: |
           set -e
+          # `npm run build` sám volá scripts/check-css.mjs, takže když Tailwind
+          # nevygeneruje CSS (chybějící postcss.config.js) nebo zůstanou surové
+          # @tailwind direktivy, build tady SELŽE – ne až na iPhonu bílou obrazovkou.
           npm run build
           test -f dist/index.html || { echo "dist/index.html chybí"; exit 1; }
           echo "Web build OK: $(du -sh dist | cut -f1)"
+
+      - name: Ověřit produkční CSS (Tailwind se skutečně vygeneroval)
+        script: |
+          set -e
+          # Samostatný krok pro rychlou diagnostiku: kdyby kontrola spadla ve
+          # "Sestavit webovou část", tady je vidět přesně které pravidlo chybí.
+          node scripts/check-css.mjs
+          echo
+          echo "--- velikost CSS ---"
+          ls -la dist/assets/*.css
+          echo
+          echo "--- ověření klíčových pravidel ---"
+          grep -q "background-color:rgb(10 10 11" dist/assets/*.css \
+            || { echo "CHYBA: chybí tmavé pozadí #0a0a0b"; exit 1; }
+          grep -q -- "-apple-system" dist/assets/*.css \
+            || { echo "CHYBA: chybí systémové písmo"; exit 1; }
+          grep -q "\.tabbar{" dist/assets/*.css \
+            || { echo "CHYBA: chybí spodní navigace (.tabbar)"; exit 1; }
+          grep -q "safe-area-inset-bottom" dist/assets/*.css \
+            || { echo "CHYBA: chybí iOS safe-area"; exit 1; }
+          if grep -qE "@tailwind (base|components|utilities)" dist/assets/*.css; then
+            echo "CHYBA: v CSS zůstaly surové @tailwind direktivy – Tailwind neproběhl"
+            echo "       (chybí postcss.config.js?)"
+            exit 1
+          fi
+          echo "Produkční CSS obsahuje Tailwind utility, tmavé pozadí, tabbar i safe-area."
 
       - name: Synchronizovat Capacitor iOS projekt
         script: |
@@ -117,6 +147,23 @@ workflows:
           test -f ios/App/App/public/index.html || { echo "Web assets nebyly zkopírovány"; exit 1; }
           grep -q '"WebRenderer"' ios/App/App/capacitor.config.json \
             || { echo "WebRenderer plugin není zaregistrován v capacitor.config.json"; exit 1; }
+          # CSS musí být zkopírováno do nativní aplikace – jinak WKWebView
+          # načte index.html bez stylů (bílá obrazovka i s dobrým dist).
+          test -f ios/App/App/public/index.html || { echo "Web assets nejsou v iOS projektu"; exit 1; }
+          IOS_CSS_COUNT="$(find ios/App/App/public/assets -maxdepth 1 -name '*.css' 2>/dev/null | wc -l | tr -d ' ')"
+          if [ "${IOS_CSS_COUNT:-0}" -eq 0 ]; then
+            echo "CHYBA: v ios/App/App/public/assets není žádné CSS – WKWebView by neměl styly"
+            exit 1
+          fi
+          IOS_CSS_SIZE="$(find ios/App/App/public/assets -maxdepth 1 -name '*.css' -exec cat {} + | wc -c | tr -d ' ')"
+          echo "CSS zkopírováno do iOS: ${IOS_CSS_COUNT} soubor(ů), ${IOS_CSS_SIZE} B"
+          if [ "${IOS_CSS_SIZE:-0}" -lt 5000 ]; then
+            echo "CHYBA: CSS v iOS je příliš malé (${IOS_CSS_SIZE} B) – Tailwind neproběhl"
+            exit 1
+          fi
+          grep -q "background-color:rgb(10 10 11" ios/App/App/public/assets/*.css \
+            || { echo "CHYBA: CSS v iOS neobsahuje tmavé pozadí"; exit 1; }
+
           echo "--- ios/App/App/capacitor.config.json ---"
           cat ios/App/App/capacitor.config.json
 
@@ -152,8 +199,8 @@ workflows:
             -destination "generic/platform=iOS" \
             -derivedDataPath build/derived \
             -allowProvisioningUpdates=NO \
-            MARKETING_VERSION="${APP_VERSION:-1.0.0}" \
-            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-1}" \
+            MARKETING_VERSION="${APP_VERSION:-1.1.0}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-2}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
