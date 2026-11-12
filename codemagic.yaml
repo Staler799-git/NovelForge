@@ -1,0 +1,55 @@
+# Codemagic CI/CD konfigurace pro NovelForge (iOS IPA)
+# Postup: nahrajte tento soubor do kořene repozitáře, připojte GitHub repo
+# v Codemagic a spusťte build. Výsledkem je .ipa soubor připravený k instalaci
+# přes Signulous.
+
+workflows:
+  novelforge-ios:
+    name: NovelForge – iOS IPA (Release)
+    max_build_duration: 120
+    environment:
+      ios:
+        xcode: latest
+      node: latest
+      cocoapods: default
+    scripts:
+      - name: Nainstalovat JavaScript závislosti
+        script: |
+          npm install --legacy-peer-deps
+      - name: Sestavit webovou část (Vite)
+        script: |
+          npm run build
+      - name: Synchronizovat do nativního iOS projektu (Capacitor)
+        script: |
+          npx cap sync ios
+      - name: Nainstalovat CocoaPods závislosti
+        script: |
+          cd ios && pod install && cd ..
+      - name: Sestavit Xcode archiv (Release, iOS device)
+        script: |
+          xcodebuild -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ./build/derived \
+            -archivePath ./build/Archive/App.xcarchive \
+            archive \
+            CODE_SIGN_STYLE=Automatic
+      - name: Exportovat IPA z archivu
+        script: |
+          mkdir -p ./build/ipa
+          xcodebuild -exportArchive \
+            -archivePath ./build/Archive/App.xcarchive \
+            -exportOptionsPlist ./export-options.plist \
+            -exportPath ./build/ipa
+      - name: Připravit artefakty
+        script: |
+          cp ./build/ipa/App.ipa ./NovelForge.ipa
+          ls -la ./NovelForge.ipa
+    artifacts:
+      - ./NovelForge.ipa
+      - ./build/derived/**/*.xccov*
+    publishing:
+      email:
+        recipients:
+          - $SENDER_EMAIL
