@@ -1,6 +1,8 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { coverSrc } from "@/services/cover";
+import { BookOpen } from "lucide-react";
 
 export function cn(...classes: (string | undefined | null | false | Record<string, boolean>)[]): string {
   return twMerge(clsx(...classes));
@@ -27,7 +29,7 @@ export function Button({ className, variant = "primary", disabled, children, ...
 export function Input({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
-      className={cn("w-full rounded-xl bg-white/4 border border-white/10 px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-transparent", className)}
+      className={cn("w-full rounded-xl bg-white/[0.04] border border-white/10 px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-transparent", className)}
       {...props}
     />
   );
@@ -36,7 +38,7 @@ export function Input({ className, ...props }: React.InputHTMLAttributes<HTMLInp
 export function Textarea({ className, ...props }: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
   return (
     <textarea
-      className={cn("w-full rounded-xl bg-white/4 border border-white/10 px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-transparent min-h-[120px]", className)}
+      className={cn("w-full rounded-xl bg-white/[0.04] border border-white/10 px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-transparent min-h-[120px]", className)}
       {...props}
     />
   );
@@ -72,7 +74,7 @@ export function Badge({ children, variant = "muted", className, ...props }: Badg
 
 export function ProgressBar({ value, className }: { value: number; className?: string }) {
   return (
-    <div className={cn("w-full bg-white/6 rounded-full h-3 overflow-hidden", className)}>
+    <div className={cn("w-full bg-white/[0.06] rounded-full h-3 overflow-hidden", className)}>
       <div className={cn("h-full bg-gradient-to-r from-pink-500 to-purple-600 transition-all duration-300", value < 100 ? "animate-pulse" : false)} style={{ width: Math.max(0, Math.min(100, value)) + "%" }} />
     </div>
   );
@@ -84,4 +86,44 @@ export function SectionTitle({ children, className }: { children: React.ReactNod
 
 export function Spinner() {
   return <div className="w-6 h-6 border-2 border-white/20 border-t-pink-500 rounded-full animate-spin" />;
+}
+
+/**
+ * Zobrazí obálku knihy načtenou z Documents jako data: URI.
+ *
+ * Dřív se používalo `capacitor://${coverPath}`, což je neplatná URL (relativní
+ * cesta se interpretovala jako hostname) – obálky se proto nezobrazovaly.
+ * `coverSrc` soubor přečte a vrátí data: URI, které funguje vždy.
+ */
+export function Cover({
+  coverPath,
+  className,
+  iconSize = 22,
+}: {
+  coverPath?: string | null;
+  className?: string;
+  iconSize?: number;
+}) {
+  const [src, setSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setSrc(null);
+    if (!coverPath) return;
+    coverSrc(coverPath).then((uri) => {
+      if (alive) setSrc(uri);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [coverPath]);
+
+  if (!src) {
+    return (
+      <div className={cn("bg-white/5 flex items-center justify-center text-white/20 rounded-xl", className)}>
+        <BookOpen size={iconSize} />
+      </div>
+    );
+  }
+  return <img src={src} alt="" className={cn("object-cover rounded-xl bg-white/5", className)} />;
 }

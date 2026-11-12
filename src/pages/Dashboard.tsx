@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { db } from "@/services/db";
 import { projectStore } from "@/store";
 import type { Project } from "@/types";
-import { Card, SectionTitle, Badge, ProgressBar, Button } from "@/components/ui";
+import { Card, SectionTitle, Badge, ProgressBar, Button, Cover } from "@/components/ui";
 import { domainOf } from "@/lib/utils";
 import { BookOpen, Download, FileText } from "lucide-react";
 
@@ -34,7 +34,7 @@ export function Dashboard() {
   return (
     <div className="p-4 space-y-5">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-white">NovelForge</h1>
+        <h1 className="text-[28px] font-bold tracking-tight text-white leading-tight">NovelForge</h1>
         <p className="text-white/60">Web novely → EPUB. Vše běží lokálně ve vašem iPhonu.</p>
       </div>
 
@@ -90,7 +90,7 @@ export function Dashboard() {
             <Card key={p.id} className="cursor-pointer group hover:border-white/10 transition-border" onClick={() => navigate(`/project/${p.id}`)}>
               <div className="flex gap-4">
                 {p.coverPath ? (
-                  <img src={`capacitor://${p.coverPath}`} alt="" className="w-20 h-28 rounded-xl object-cover bg-white/5" />
+                  <Cover coverPath={p.coverPath} className="w-20 h-28" />
                 ) : (
                   <div className="w-20 h-28 rounded-xl bg-white/5 flex items-center justify-center text-white/20">
                     <BookOpen size={20} />

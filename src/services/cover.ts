@@ -70,3 +70,46 @@ export async function saveCoverBase64(base64: string, filename: string): Promise
 export function coverDataUri(base64: string, mime = "image/jpeg"): string {
   return `data:${mime};base64,${base64}`;
 }
+
+/**
+ * Vrátí URL použitelnou přímo v <img src>.
+ *
+ * POZOR: dřívější kód skládal `capacitor://${coverPath}`. To je neplatná URL –
+ * coverPath je RELATIVNÍ cesta v Documents (např. "NovelForge/covers/x.jpg"),
+ * takže vzniklo `capacitor://NovelForge/covers/x.jpg`, kde "NovelForge" je
+ * hostname. WKWebView soubor nenašel a obálka se nezobrazila (prázdný rám).
+ *
+ * Správně: přečíst soubor přes Filesystem a vrátit data: URI. Funguje to
+ * shodně v prohlížeči i v nativním WebView a nezávisí na allowNavigation.
+ */
+export async function coverSrc(coverPath: string | undefined | null): Promise<string | null> {
+  if (!coverPath) return null;
+  try {
+    const res = await Filesystem.readFile({
+      path: coverPath,
+      directory: Directory.Documents,
+    });
+    const data = typeof res.data === "string" ? res.data : await blobToBase64(res.data);
+    if (!data) return null;
+    const mime = coverPath.toLowerCase().endsWith(".svg")
+      ? "image/svg+xml"
+      : coverPath.toLowerCase().endsWith(".png")
+        ? "image/png"
+        : "image/jpeg";
+    return `data:${mime};base64,${data}`;
+  } catch {
+    return null;
+  }
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = String(reader.result ?? "");
+      resolve(result.includes(",") ? result.split(",")[1] : result);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
