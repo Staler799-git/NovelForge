@@ -81,6 +81,11 @@ workflows:
           echo "--- Capacitor packages ---"
           npm ls @capacitor/core @capacitor/cli @capacitor/ios --depth=0
 
+      - name: Validovat codemagic.yaml proti schématu
+        script: |
+          set -e
+          npm run validate:codemagic
+
       - name: Statická kontrola TypeScriptu
         script: |
           set -e
@@ -197,16 +202,26 @@ workflows:
       events:
         - pull_request
       branch_patterns:
+        # `source: true` = pattern se vztahuje na zdrojovou (head) větev PR.
+        # Pro cílovou větev se používá samostatný záznam se source: false
+        # (schéma Codemagic nezná klíč `target`).
         - pattern: "*"
           include: true
           source: true
-          target: true
+        - pattern: main
+          include: true
+          source: false
 
     scripts:
       - name: Instalace závislostí
         script: |
           set -e
           npm ci --no-audit --no-fund
+
+      - name: Validovat codemagic.yaml proti schématu
+        script: |
+          set -e
+          npm run validate:codemagic
 
       - name: TypeScript kontrola
         script: |
