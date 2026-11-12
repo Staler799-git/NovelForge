@@ -13,7 +13,9 @@ export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
 }
 
 export function Button({ className, variant = "primary", disabled, children, ...props }: ButtonProps) {
-  const base = "inline-flex items-center justify-center gap-2 rounded-xl font-medium text-sm transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none";
+  // px/py + min-h-[44px]: bez nich bylo tlačítko vysoké jen jako text
+  // (iOS doporučuje dotykovou plochu min. 44 pt).
+  const base = "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 min-h-[44px] font-semibold text-sm transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none";
   const variants: Record<string, string> = {
     primary: "bg-gradient-to-br from-pink-500 via-purple-600 to-pink-700 text-white shadow-lg shadow-purple-600/25 hover:from-pink-400 hover:via-purple-500 hover:to-purple-600",
     ghost: "bg-white/5 border border-white/10 text-white hover:bg-white/10",
@@ -66,7 +68,7 @@ export function Badge({ children, variant = "muted", className, ...props }: Badg
     muted: "bg-white/5 text-white/50 border border-white/10",
   };
   return (
-    <span className={cn("rounded-full px-2.5 py-0.5 text-[11px] font-medium border", variants[variant], className)} {...props}>
+    <span className={cn("inline-block rounded-2xl px-2.5 py-0.5 text-[11px] font-medium border", variants[variant], className)} {...props}>
       {children}
     </span>
   );

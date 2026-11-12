@@ -13,7 +13,7 @@ import { LayoutDashboard, PlusCircle, ArrowDownToLine, Library as LibraryIcon, S
  * obě Download – z UI se nedalo poznat, kde jsi.
  */
 const tabs = [
-  { path: "/", label: "Přehled", icon: LayoutDashboard },
+  { path: "/", label: "Dashboard", icon: LayoutDashboard },
   { path: "/new", label: "Nové", icon: PlusCircle },
   { path: "/downloads", label: "Stahování", icon: ArrowDownToLine },
   { path: "/library", label: "Knihovna", icon: LibraryIcon },

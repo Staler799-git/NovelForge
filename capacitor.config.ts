@@ -10,7 +10,10 @@ const config: CapacitorConfig = {
     scheme: "App",
     // Keep CocoaPods in sync with the committed ios/App/App.xcworkspace + Podfile.
     // (Capacitor 8 creates new projects with SPM by default, this repo uses Pods.)
-    contentInset: "always",
+    // "never" + viewport-fit=cover v index.html: WebView vyplní celý displej
+    // a odsazení od Dynamic Islandu / Home Indicatoru řeší CSS přes
+    // env(safe-area-inset-*). S "always" by se odsazení aplikovalo dvakrát.
+    contentInset: "never",
     backgroundColor: "#0a0a0b",
     limitsNavigationsToAppBoundDomains: false,
   },
