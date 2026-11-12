@@ -40,11 +40,13 @@ export async function pickCoverFromGallery(): Promise<{ path: string; base64: st
     if (!photo.base64String) return null;
     const filename = `cover-${crypto.randomUUID()}.jpg`;
     const path = storage.coverPath(filename);
+    // POZOR: base64String z Camera API je binární JPEG zakódovaný do base64.
+    // Bez `encoding` zapíše Filesystem plugin skutečná binární data; s
+    // Encoding.UTF8 by se zapsal base64 TEXT a soubor by nebyl platný obrázek.
     await Filesystem.writeFile({
       path,
       data: photo.base64String,
       directory: Directory.Documents,
-      encoding: Encoding.UTF8,
     });
     return { path, base64: photo.base64String };
   } catch (err) {
@@ -56,11 +58,11 @@ export async function pickCoverFromGallery(): Promise<{ path: string; base64: st
 export async function saveCoverBase64(base64: string, filename: string): Promise<string> {
   await storage.init();
   const path = storage.coverPath(filename);
+  // Binární zápis – viz komentář výše (base64 → skutečné bajty JPEG).
   await Filesystem.writeFile({
     path,
     data: base64,
     directory: Directory.Documents,
-    encoding: Encoding.UTF8,
   });
   return path;
 }
