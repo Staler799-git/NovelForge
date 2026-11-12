@@ -98,23 +98,33 @@ MIN_OS="$(plist MinimumOSVersion)"
 [ "$BUNDLE_ID_ACTUAL" = "$EXPECTED_BUNDLE_ID" ] || fail "Bundle ID nesouhlasí: '$BUNDLE_ID_ACTUAL' != '$EXPECTED_BUNDLE_ID'."
 [ -n "$EXECUTABLE_NAME" ] || fail "Info.plist neobsahuje CFBundleExecutable."
 
+case "$EXECUTABLE_NAME" in
+  *'$('*|'') fail "CFBundleExecutable obsahuje nevyhodnocenou proměnnou: '$EXECUTABLE_NAME'" ;;
+esac
 BINARY_PATH="${APP_PATH}/${EXECUTABLE_NAME}"
 [ -f "$BINARY_PATH" ] || fail "Chybí spustitelný binární soubor: $BINARY_PATH"
 [ -x "$BINARY_PATH" ] || fail "Binární soubor není spustitelný: $BINARY_PATH"
 
 ARCHS="$(lipo -archs "$BINARY_PATH" 2>/dev/null || file "$BINARY_PATH")"
 echo "$ARCHS" | grep -q "arm64" || fail "Binárka neobsahuje arm64 (simulátorový build?): $ARCHS"
-echo "$ARCHS" | grep -q "x86_64"     && fail "Binárka obsahuje x86_64 – jde o simulátorový build: $ARCHS"
-echo "$ARCHS" | grep -q "i386"       && fail "Binárka obsahuje i386 – jde o simulátorový build: $ARCHS"
+# Device builds are arm64 (popř. arm64e). x86_64/i386 znamená simulátor.
+if echo "$ARCHS" | grep -qE "x86_64|i386"; then
+  fail "Binárka obsahuje x86_64/i386 – jde o simulátorový build: $ARCHS"
+fi
 
-# Platform check: iOS device binaries are Mach-O for platform IOS (LC_BUILD_VERSION platform 2)
+# Rozhodující kontrola: Mach-O build platforma. LC_BUILD_VERSION platform
+#   2 = PLATFORM_IOS (zařízení), 7 = PLATFORM_IOSSIMULATOR.
+# POZOR: `lipo -archs` na Apple Silicon nemusí x86_64 vidět, proto se
+# platforma ověřuje zvlášť a odmítá se jakákoli simulátorová varianta.
 PLATFORM_INFO="$(vtool -show-build "$BINARY_PATH" 2>/dev/null || true)"
-if echo "$PLATFORM_INFO" | grep -qi "platform IOS"; then
-  ok "Mach-O platforma: IOS (fyzické zařízení)"
-elif echo "$PLATFORM_INFO" | grep -qi "platform IOSSIMULATOR"; then
+# vtool vypisuje "platform: IOS" / "platform: IOSSIMULATOR" – testujeme
+# podřetězec bez dvojtečky, aby prošly oba formáty výstupu.
+if echo "$PLATFORM_INFO" | grep -qiE "IOSSIMULATOR|IOS_SIMULATOR|SIMULATOR"; then
   fail "Binárka je postavena pro iOS Simulator, nikoli pro zařízení."
+elif echo "$PLATFORM_INFO" | grep -qiE "platform[: ]+IOS\b"; then
+  ok "Mach-O platforma: IOS (fyzické zařízení)"
 else
-  echo "  (vtool neposkytl platformu, pokračuji s kontrolou architektur)"
+  echo "  (vtool neposkytl platformu – pokračuji; architektura $ARCHS je arm64-only)"
 fi
 
 WEB_ASSETS="${APP_PATH}/public/index.html"

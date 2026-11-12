@@ -3,41 +3,29 @@
 # =============================================================================
 #
 # Workflow: ios-device-unsigned
-#   "NovelForge – iOS IPA for Signulous"
+#   Název v Codemagic UI: "NovelForge – iOS IPA for Signulous"
 #
 # Sestaví skutečnou iOS aplikaci pro fyzický iPhone (generic/platform=iOS,
 # iPhoneOS SDK, arm64), ZCELA BEZ PODPISU, zabalí ji do NovelForge.ipa a tu do
 # NovelForge-Signulous.zip. Podpis provádí až Signulous – tento workflow
 # NEPOUŽÍVÁ Apple Developer účet, App Store Connect, TestFlight, certifikáty
-# ani provisioning profiles.
+# ani provisioning profiles, a neposílá e-mailové notifikace.
 #
 # Artefakty (Codemagic → Artifacts):
 #   artifacts/NovelForge-Signulous.zip   ← hlavní soubor ke stažení (obsahuje IPA)
 #   artifacts/NovelForge.ipa             ← samostatná IPA jako záloha
 #   artifacts/build-info.txt             ← Bundle ID, verze, architektury
+#   build/xcodebuild.log                 ← log pro diagnostiku
 #
 # Workflow: novelforge-web-tests (volitelný)
 #   Rychlá kontrola webové části (npm ci / tsc / vite build / vitest) na Linuxu.
 #
-# Manuální spuštění: Codemagic → Start new build → branch "main" → vybrat workflow.
+# Manuální spuštění: Codemagic → Start new build → branch main → vybrat workflow.
 # Automatický build: triggering.events: push, branch_patterns: main.
+#
+# POZNÁMKA: Hodnoty jsou záměrně vypsané přímo (bez YAML merge keys `<<`),
+# aby konfigurace nezávisela na tom, jaký YAML parser Codemagic používá.
 # =============================================================================
-
-definitions:
-  # Verze nástrojů – jedna změna platí pro všechny workflow.
-  env_versions: &env_versions
-    node: 22.22.1 # Capacitor CLI 8 vyžaduje Node >= 22
-    xcode: latest # aktuální oficiální Xcode na macOS stroji (Xcode 26.x)
-    cocoapods: default # CocoaPods předinstalovaný v imagi (1.16.x)
-    ruby: default
-
-  # Sdílené proměnné projektu
-  project_vars: &project_vars
-    BUNDLE_ID: com.novelforge.app
-    XCODE_SCHEME: App
-    XCODE_WORKSPACE: ios/App/App.xcworkspace
-    # Verze se berou z package.json; BUILD_NUMBER dodá Codemagic.
-    APP_VERSION: 1.0.0
 
 workflows:
   # ===========================================================================
@@ -49,13 +37,16 @@ workflows:
     max_build_duration: 120
 
     environment:
-      <<: *env_versions
+      node: 22.22.1 # @capacitor/cli 8 vyžaduje Node >= 22
+      xcode: latest # aktuální oficiální Xcode na macOS stroji (Xcode 26.x)
+      cocoapods: default # CocoaPods předinstalovaný v imagi (1.16.x)
+      ruby: default
       vars:
-        <<: *project_vars
+        BUNDLE_ID: com.novelforge.app
+        XCODE_SCHEME: App
+        XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_PROJECT: ios/App/App.xcodeproj
-        # CocoaPods: Capacitor 8 by default prefers SPM, but this repository
-        # commits ios/App/App.xcworkspace + Podfile, so CocoaPods is mandatory.
-        CAPACITOR_COCOAPODS_PATH: /usr/local/bin/pod
+        APP_VERSION: 1.0.0
 
     cache:
       cache_paths:
@@ -79,15 +70,15 @@ workflows:
           echo "Node: $(node -v)"; echo "npm: $(npm -v)"
           echo "CocoaPods: $(pod --version)"
           echo "Ruby: $(ruby -v)"
-          xcodebuild -showsdks | grep -i iphoneos || true
           echo "Selected Xcode: $(xcode-select -p)"
+          xcodebuild -showsdks | grep -i iphoneos || true
 
       - name: Nainstalovat npm závislosti (npm ci)
         script: |
           set -e
           node -e "const v=process.versions.node.split('.').map(Number); if (v[0] < 22) { console.error('Node >= 22 is required, found '+process.version); process.exit(1); }"
           npm ci --no-audit --no-fund
-          echo "Capacitor packages:"
+          echo "--- Capacitor packages ---"
           npm ls @capacitor/core @capacitor/cli @capacitor/ios --depth=0
 
       - name: Statická kontrola TypeScriptu
@@ -98,7 +89,7 @@ workflows:
       - name: Unit testy (vitest)
         script: |
           set -e
-          npm test -- --reporter=verbose
+          npm test
 
       - name: Sestavit webovou část (Vite → dist/)
         script: |
@@ -111,13 +102,13 @@ workflows:
         script: |
           set -e
           npx cap sync ios --deployment
-          # Capacitor neumí auto-registrovat pluginy definované přímo v tomto repu
-          # (ios/App/App/Plugins/WebRenderer.swift) – doplníme je do packageClassList.
+          # Capacitor auto-registruje jen pluginy z node_modules. WebRenderer.swift
+          # je lokální plugin v tomto repu, doplníme ho do packageClassList.
           node scripts/patch-ios-plugins.mjs
           test -f ios/App/App/public/index.html || { echo "Web assets nebyly zkopírovány"; exit 1; }
           grep -q '"WebRenderer"' ios/App/App/capacitor.config.json \
             || { echo "WebRenderer plugin není zaregistrován v capacitor.config.json"; exit 1; }
-          echo "--- capacitor.config.json ---"
+          echo "--- ios/App/App/capacitor.config.json ---"
           cat ios/App/App/capacitor.config.json
 
       - name: Instalace CocoaPods závislostí (pod install)
@@ -127,25 +118,25 @@ workflows:
           pod --version
           pod install --repo-update
           test -f Pods/Manifest.lock || { echo "pod install neproběhl"; exit 1; }
-          test -d App.xcworkspace || { echo "xcworkspace chybí"; exit 1; }
-          echo "--- Nainstalované pody ---"
-          pod list 2>/dev/null | head -40 || true
+          test -f App.xcworkspace/contents.xcworkspacedata || { echo "xcworkspace je neplatný"; exit 1; }
+          echo "--- Nainstalované pod závislosti ---"
+          ls Pods | head -40
           cd ../..
 
       - name: Sestavit unsigned aplikaci pro fyzický iPhone
         script: |
           set -e
-          # generic/platform=iOS + iphoneos SDK => zařízení, ne simulátor.
+          # generic/platform=iOS + -sdk iphoneos => fyzické zařízení, nikoli simulátor.
           xcodebuild \
-            -workspace "$XCODE_WORKSPACE" \
-            -scheme "$XCODE_SCHEME" \
+            -workspace "${XCODE_WORKSPACE:-ios/App/App.xcworkspace}" \
+            -scheme "${XCODE_SCHEME:-App}" \
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
             -derivedDataPath build/derived \
             -allowProvisioningUpdates=NO \
-            MARKETING_VERSION="$APP_VERSION" \
-            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="${APP_VERSION:-1.0.0}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-1}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -160,9 +151,8 @@ workflows:
       - name: Vytvořit IPA, ZIP a ověřit integritu
         script: |
           set -e
+          # Skript ověří IPA i ZIP; při jakékoli chybě skončí exit 1 => build FAILED.
           bash scripts/build-ios-unsigned.sh
-          # build-ios-unsigned.sh sám ukončí build s chybou (exit 1), pokud
-          # IPA nebo ZIP chybí, jsou prázdné nebo poškozené.
 
       - name: Souhrn artefaktů
         script: |
@@ -182,7 +172,7 @@ workflows:
           echo "=== INFO ==="
           cat artifacts/build-info.txt
           echo
-          echo "SHA256:"
+          echo "=== SHA256 ==="
           shasum -a 256 artifacts/NovelForge.ipa artifacts/NovelForge-Signulous.zip
 
     artifacts:
