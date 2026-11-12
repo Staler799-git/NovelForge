@@ -41,9 +41,13 @@ export default function App() {
     };
   }, []);
 
-  if (!ready) return null;
+  // Všechny hooky musí být volány bezpodmínečně, před jakýmkoli return.
+  // `useNavigate` navíc vyžaduje, aby komponenta byla UVNITŘ <Router> – proto
+  // je navigace řešena v oddělené komponentě <AppShell>, která se renderuje
+  // až jako potomek <BrowserRouter>. Dřívější varianta volala useNavigate()
+  // ještě před <BrowserRouter> a shazovala celou aplikaci bílou obrazovkou:
+  //   Error: useNavigate() may be used only in the context of a <Router>
 
-  const navigate = useNavigate();
   const store = projectStore;
 
   useEffect(() => {
@@ -58,20 +62,34 @@ export default function App() {
     };
   }, [store]);
 
+  if (!ready) return null;
+
   return (
     <BrowserRouter>
-      <div className="min-h-screen bg-dark-900 text-white">
-        <TabNavigator onTab={navigate} />
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/new" element={<NewDownload />} />
-          <Route path="/downloads" element={<Downloads />} />
-          <Route path="/library" element={<Library />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/project/:id" element={<ProjectDetail />} />
-          <Route path="/project/:id/export" element={<EpubExport />} />
-        </Routes>
-      </div>
+      <AppShell />
     </BrowserRouter>
+  );
+}
+
+/**
+ * Vnitřek aplikace – renderuje se až pod <BrowserRouter>, takže `useNavigate`
+ * má k dispozici router kontext.
+ */
+function AppShell() {
+  const navigate = useNavigate();
+
+  return (
+    <div className="min-h-screen bg-dark-900 text-white">
+      <TabNavigator onTab={(to) => navigate(to)} />
+      <Routes>
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/new" element={<NewDownload />} />
+        <Route path="/downloads" element={<Downloads />} />
+        <Route path="/library" element={<Library />} />
+        <Route path="/settings" element={<Settings />} />
+        <Route path="/project/:id" element={<ProjectDetail />} />
+        <Route path="/project/:id/export" element={<EpubExport />} />
+      </Routes>
+    </div>
   );
 }
