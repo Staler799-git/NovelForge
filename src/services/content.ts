@@ -1,3 +1,4 @@
+import { parseHtml } from "./html";
 /**
  * Práce s obsahem kapitol: převod HTML -> well-formed XHTML, normalizace textu,
  * otisky obsahu, ověření, že stránka opravdu obsahuje text kapitoly.
@@ -62,7 +63,7 @@ function serialize(node: Node, out: string[]): void {
  * samouzavíracími `<br/>`, s číselnými entitami a bez skriptů/reklam.
  */
 export function sanitizeToXhtml(html: string): string {
-  const doc = new DOMParser().parseFromString(`<!DOCTYPE html><html><body>${html}</body></html>`, "text/html");
+  const doc = parseHtml(`<!DOCTYPE html><html><body>${html}</body></html>`);
   const out: string[] = [];
   const pending: string[] = [];
   const flush = () => {
@@ -90,7 +91,7 @@ export function sanitizeToXhtml(html: string): string {
 export function htmlToText(html: string): string {
   // Hranice bloků a <br> musí oddělit slova ("a<br>b" není "ab").
   const spaced = html.replace(/<(br|\/p|\/div|\/h[1-6]|\/li|\/tr|\/td|\/blockquote|hr)\b[^>]*>/gi, "$& ");
-  const doc = new DOMParser().parseFromString(`<!DOCTYPE html><html><body>${spaced}</body></html>`, "text/html");
+  const doc = parseHtml(`<!DOCTYPE html><html><body>${spaced}</body></html>`);
   for (const el of Array.from(doc.body.querySelectorAll("script, style, noscript"))) el.remove();
   return (doc.body.textContent ?? "").replace(/\s+/g, " ").trim();
 }

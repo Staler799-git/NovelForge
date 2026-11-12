@@ -137,7 +137,7 @@ describe("EPUB generator", () => {
     expect(await text("OEBPS/chapter-00002.xhtml")).toContain("Second body.");
     expect(await text("OEBPS/chapter-00003.xhtml")).toContain("Third body.");
 
-    const nav = new DOMParser().parseFromString(await text("OEBPS/nav.xhtml"), "application/xml");
+    const nav = new DOMParser().parseFromString((await text("OEBPS/nav.xhtml")).replace(/<link[^>]*\/>/, ""), "application/xml");
     const links = Array.from(nav.getElementsByTagName("a"));
     expect(links.map((a) => a.textContent)).toEqual(["Alpha", "Beta", "Gamma"]);
     expect(links.map((a) => a.getAttribute("href"))).toEqual(["chapter-00001.xhtml", "chapter-00002.xhtml", "chapter-00003.xhtml"]);

@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
+import { parseHtml, inertHtml } from "@/services/html";
 import { XMLValidator } from "fast-xml-parser";
 import { sanitizeToXhtml, contentHash, textSimilarity, assertChapterContent, hash64, htmlToText } from "@/services/content";
 import { findCoverUrl, detectLanguage, normalizeLanguage, detectBlockPage } from "@/services/parser/base";
 
 const wellFormed = (fragment: string) => XMLValidator.validate(`<root>${fragment}</root>`);
-const doc = (html: string) => new DOMParser().parseFromString(html, "text/html");
+const doc = (html: string) => parseHtml(html);
 
 describe("sanitizeToXhtml", () => {
   it("z HTML udělá well-formed XHTML (br, entity, neuzavřené tagy)", () => {
@@ -37,6 +38,20 @@ describe("sanitizeToXhtml", () => {
   it("odstraní znaky zakázané v XML", () => {
     const out = sanitizeToXhtml("<p>a\u0000b\u000Bc</p>");
     expect(out).toBe("<p>abc</p>");
+  });
+});
+
+describe("inertHtml", () => {
+  it("odstraní skripty, iframy a odkazy na styly, JSON-LD a ostatní <link> nechá", () => {
+    const out = inertHtml(
+      `<head><link rel="stylesheet" href="/a.css"><link href="/b.css" rel='stylesheet'><link rel="image_src" href="/c.jpg">` +
+        `<script src="/x.js"></script><script type="application/ld+json">{"image":"/d.jpg"}</script></head>` +
+        `<body><iframe src="https://ads.example/frame"></iframe><p>Text</p><script>var a = "<p>x</p>";</script><embed src="/e.swf"></body>`,
+    );
+    expect(out).not.toMatch(/stylesheet|<iframe|x\.js|var a|<embed/);
+    expect(out).toContain('<link rel="image_src" href="/c.jpg">');
+    expect(out).toContain('{"image":"/d.jpg"}');
+    expect(out).toContain("<p>Text</p>");
   });
 });
 

@@ -1,3 +1,4 @@
+import { parseHtml } from "../html";
 import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
 import { http, HttpError, isAbort } from "@/services/http";
 
@@ -120,7 +121,7 @@ export abstract class NovelParser {
   }
 
   protected parseHtml(html: string): Document {
-    return new DOMParser().parseFromString(html, "text/html");
+    return parseHtml(html);
   }
 
   protected meta(doc: Document, name: string): string | null {
