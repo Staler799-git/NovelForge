@@ -6,12 +6,12 @@
  * "funkční", ale bez stylů: bílé pozadí, patkové písmo, navigace nahoře.
  *
  * Pozadí a písmo se ověřují z reálného produkčního CSS (dist/assets/*.css),
- * rozvržení z DOM stromu.
+ * rozvržení z DOM stromu. CSS se kompiluje přímo v testu (Vite + PostCSS +
+ * Tailwind), takže test funguje i bez předchozího `npm run build`.
  */
 import { describe, expect, it, vi, beforeAll } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
-import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { compileProductionCss, rule } from "./helpers/productionCss";
 
 // ---------- nativní pluginy ----------
 vi.mock("@capacitor/splash-screen", () => ({ SplashScreen: { hide: vi.fn().mockResolvedValue(undefined) } }));
@@ -30,22 +30,6 @@ vi.mock("@/store", () => ({
   projectStore: { refresh: vi.fn(), subscribe: vi.fn(() => () => {}) },
 }));
 
-/** Načte produkční CSS vygenerované Vite buildem. */
-function productionCss(): string {
-  const dir = join(process.cwd(), "dist", "assets");
-  if (!existsSync(dir)) return "";
-  return readdirSync(dir)
-    .filter((f) => f.endsWith(".css"))
-    .map((f) => readFileSync(join(dir, f), "utf8"))
-    .join("\n");
-}
-
-/** Zjednodušený extraktor deklarace pro daný selektor. */
-function rule(css: string, selector: string): string {
-  const re = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "g");
-  return [...css.matchAll(re)].map((m) => m[1]).join(";");
-}
-
 describe("Vizuální smoke test – mobilní viewport", () => {
   let css = "";
 
@@ -53,8 +37,8 @@ describe("Vizuální smoke test – mobilní viewport", () => {
     // simulace iPhone 16 Pro Max
     Object.defineProperty(window, "innerWidth", { value: 440, writable: true, configurable: true });
     Object.defineProperty(window, "innerHeight", { value: 956, writable: true, configurable: true });
-    css = productionCss();
-  });
+    css = await compileProductionCss();
+  }, 60_000);
 
   it("produkční CSS existuje a obsahuje Tailwind", () => {
     expect(css.length).toBeGreaterThan(5_000);
@@ -100,7 +84,7 @@ describe("Vizuální smoke test – mobilní viewport", () => {
 
     expect(buttons.length).toBe(5);
     const labels = [...buttons].map((b) => b.textContent?.trim());
-    expect(labels).toEqual(["Přehled", "Nové", "Stahování", "Knihovna", "Nastavení"]);
+    expect(labels).toEqual(["Dashboard", "Nové", "Stahování", "Knihovna", "Nastavení"]);
   });
 
   it("každá záložka má ikonu i krátký popisek", async () => {

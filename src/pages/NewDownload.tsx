@@ -120,6 +120,7 @@ export function NewDownload() {
 
   return (
     <div className="p-4 space-y-5 max-w-[640px] mx-auto">
+      <h1 className="text-[28px] font-bold tracking-tight text-white leading-tight">Nové stahování</h1>
       {step === "url" && (
         <Card>
           <SectionTitle>Adresa web novely</SectionTitle>

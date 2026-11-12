@@ -92,7 +92,7 @@ export function Settings() {
         <div className="space-y-3">
           <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
             <span className="text-white">NovelForge</span>
-            <span className="text-white/50">v1.0.0</span>
+            <span className="text-white/50">v{__APP_VERSION__}</span>
           </div>
           <div className="text-xs text-white/50 leading-relaxed">
             Web novely → EPUB. Všechny údaje a knihy jsou uloženy pouze ve vašem zařízení. Nevyžaduje účet, server ani placené API.
