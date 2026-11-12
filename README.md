@@ -177,6 +177,19 @@ npm run ios:build:unsigned      # → artifacts/NovelForge.ipa + artifacts/Novel
 > limitu zařízení). Aplikace **nepoužívá žádné entitlements** (bez push, bez iCloud, bez App Groups),
 > takže podpis přes Signulous je bez konfliktů. Info.plist obsahuje `ITSAppUsesNonExemptEncryption=false`.
 
+### Validace codemagic.yaml
+Codemagic odmítne build, pokud yaml neodpovídá jeho schématu (v UI se objeví
+„Configuration file error ... extra fields not permitted"). Proto je v repu
+commitnuté oficiální schéma a lokální validátor:
+
+```bash
+npm run validate:codemagic            # validace proti schema/codemagic-schema.json
+npm run validate:codemagic -- --update-schema   # stažení aktuálního schématu
+```
+
+Validátor běží i jako krok v obou Codemagic workflochech, takže se chyba
+v konfiguraci projeví dřív než `npm ci` a nezdržuje macOS minuty.
+
 ### Ověření iOS buildu
 iOS build **nebyl v tomto prostředí ověřen** – sandbox je Linux bez Xcode a CocoaPods.
 Ověřeno bylo: `npm ci`, TypeScript, vitest, `vite build`, `npx cap sync ios`, syntaktická validita

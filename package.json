@@ -13,7 +13,8 @@
     "ios:copy": "npx cap copy ios && node scripts/patch-ios-plugins.mjs",
     "ios:open": "npx cap open ios",
     "ios:add": "npx cap add ios",
-    "ios:build:unsigned": "bash scripts/build-ios-unsigned.sh"
+    "ios:build:unsigned": "bash scripts/build-ios-unsigned.sh",
+    "validate:codemagic": "node scripts/validate-codemagic.mjs"
   },
   "dependencies": {
     "@capacitor-community/sqlite": "^8.1.1",
@@ -49,13 +50,16 @@
     "@types/react-dom": "^19.1.0",
     "@types/uuid": "^10.0.0",
     "@vitejs/plugin-react": "^4.5.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
     "autoprefixer": "^10.4.17",
     "happy-dom": "^15.11.0",
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
     "typescript": "~5.8.2",
     "vite": "^7.0.0",
-    "vitest": "^3.1.0"
+    "vitest": "^3.1.0",
+    "yaml": "^2.8.1"
   },
   "engines": {
     "node": ">=22.0.0"
