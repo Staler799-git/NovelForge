@@ -137,12 +137,41 @@ grep -q "WebRenderer" "$CAP_CONFIG" || fail "capacitor.config.json neobsahuje re
 
 FRAMEWORK_COUNT="$(find "${APP_PATH}/Frameworks" -maxdepth 1 -name '*.framework' 2>/dev/null | wc -l | tr -d ' ')"
 [ "${FRAMEWORK_COUNT:-0}" -gt 0 ] || fail "Aplikace neobsahuje žádné frameworky (Capacitor/Pods se neembedovaly)."
-# Pod názvy = názvy frameworků, které musí být v Payload/App.app/Frameworks.
-for required in Capacitor CapacitorCordova CapacitorCommunitySqlite CapacitorApp CapacitorFilesystem CapacitorShare; do
-  [ -d "${APP_PATH}/Frameworks/${required}.framework" ] \
-    || fail "Chybí framework ${required}.framework v ${APP_PATH}/Frameworks"
+# Pody, které musí být v Payload/App.app/Frameworks přítomné.
+# POZOR: název .framework NENÍ vždy název podu. CocoaPods sestaví framework
+# podle `s.module_name` z podspecu (lib/cocoapods/target.rb: product_basename
+# -> product_module_name -> framework_name). Třeba CapacitorCordova.podspec
+# má `s.module_name = 'Cordova'`, takže vzniká Cordova.framework – kontrola
+# na "CapacitorCordova.framework" by vždy selhala, i když je vše správně.
+podspec_module_name() {
+  local podspec="$1" fallback="$2" found
+  found="$(grep -oE "module_name[[:space:]]*=[[:space:]]*['\"][^'\"]+" "$podspec" 2>/dev/null \
+    | head -1 | sed -E "s/.*['\"]//")"
+  printf '%s' "${found:-$fallback}"
+}
+
+MISSING_FRAMEWORKS=""
+for pod in Capacitor CapacitorCordova CapacitorCommunitySqlite CapacitorApp CapacitorFilesystem CapacitorShare; do
+  podspec=""
+  for candidate in node_modules/@capacitor/*/"${pod}".podspec node_modules/@capacitor-community/*/"${pod}".podspec; do
+    [ -f "$candidate" ] && podspec="$candidate" && break
+  done
+  if [ -z "$podspec" ]; then
+    echo "  (podspec pro ${pod} nenalezen – kontroluji název podu)"
+    framework_name="$pod"
+  else
+    framework_name="$(podspec_module_name "$podspec" "$pod")"
+  fi
+  if [ ! -d "${APP_PATH}/Frameworks/${framework_name}.framework" ]; then
+    MISSING_FRAMEWORKS="${MISSING_FRAMEWORKS} ${framework_name}.framework(pod:${pod})"
+  fi
 done
-ok "Frameworky: ${FRAMEWORK_COUNT} (Capacitor, CapacitorCordova, CapacitorCommunitySqlite a další pluginy přítomny)"
+if [ -n "$MISSING_FRAMEWORKS" ]; then
+  echo "  Obsah ${APP_PATH}/Frameworks:"
+  ls -1 "${APP_PATH}/Frameworks" 2>/dev/null | sed 's/^/    /'
+  fail "Chybí framework(y):${MISSING_FRAMEWORKS}"
+fi
+ok "Frameworky: ${FRAMEWORK_COUNT} (Capacitor, Cordova, CapacitorCommunitySqlite a další pluginy přítomny)"
 
 SWIFT_LIBS="$(find "${APP_PATH}" -maxdepth 2 -name 'libswift*.dylib' 2>/dev/null | wc -l | tr -d ' ')"
 [ "${SWIFT_LIBS:-0}" -gt 0 ] || echo "  (poznámka: Swift runtime knihovny nejsou přibaleny – Xcode 26 je dodává systém, nevadí)"
