@@ -15,6 +15,7 @@ import { ProjectDetail } from "./pages/ProjectDetail";
 import { EpubExport } from "./pages/EpubExport";
 import { TabNavigator } from "./layout/TabNavigator";
 import { projectStore } from "./store";
+import { downloadManager } from "./services/downloader";
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -22,18 +23,25 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
     const init = async () => {
-      try {
-        await SplashScreen.hide?.();
-        await StatusBar.setBackgroundColor({ color: "#0a0a0b" });
-        await StatusBar.setStyle({ style: Style.Dark });
-        await Keyboard.setResizeMode({ mode: KeyboardResize.Ionic });
-        await storage.init();
-        await db.init();
-        if (mounted) setReady(true);
-      } catch (err) {
-        console.error("Init failed", err);
-        if (mounted) setReady(true);
-      }
+      // Každý krok zvlášť: selhání kosmetického volání (např.
+      // StatusBar.setBackgroundColor na iOS neexistuje) nesmí přeskočit
+      // inicializaci úložiště a databáze.
+      const step = async (name: string, fn: () => Promise<unknown>) => {
+        try {
+          await fn();
+        } catch (err) {
+          console.warn(`Init: ${name} selhalo`, err);
+        }
+      };
+      await step("storage", () => storage.init());
+      await step("db", () => db.init());
+      // Stahování přerušená ukončením aplikace se nabídnou k pokračování.
+      await step("recover", () => downloadManager.recoverInterrupted());
+      await step("statusbar-style", () => StatusBar.setStyle({ style: Style.Dark }));
+      await step("statusbar-color", () => StatusBar.setBackgroundColor({ color: "#0a0a0b" }));
+      await step("keyboard", () => Keyboard.setResizeMode({ mode: KeyboardResize.Ionic }));
+      await step("splash", async () => SplashScreen.hide?.());
+      if (mounted) setReady(true);
     };
     init();
     return () => {

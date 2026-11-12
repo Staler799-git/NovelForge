@@ -1,5 +1,5 @@
 import { NovelParser } from "./base";
-import type { NovelMetadata, ParserChapter } from "@/types";
+import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
 import { GenericNovelParser } from "./generic";
 import { WuxiaBoxParser } from "./wuxiabox";
 
@@ -17,15 +17,20 @@ export function getParser(url: string): NovelParser {
 
 const genericParser = new GenericNovelParser();
 
-export async function parseMetadata(url: string, opts?: any): Promise<NovelMetadata> {
+export async function parseMetadata(url: string, opts?: FetchOptions): Promise<NovelMetadata> {
   return getParser(url).fetchMetadata(url, opts);
 }
 
-export async function parseChapterList(url: string, opts?: any): Promise<ParserChapter[]> {
+export async function parseChapterList(url: string, opts?: FetchOptions): Promise<ParserChapter[]> {
   return getParser(url).fetchChapterList(url, opts);
 }
 
-export async function parseChapter(url: string, opts?: any): Promise<{ title: string; html: string }> {
+/** Celý katalog včetně informací o úplnosti, s průběhem a možností zastavení. */
+export async function parseCatalog(url: string, opts?: FetchOptions): Promise<CatalogResult> {
+  return getParser(url).fetchCatalog(url, opts);
+}
+
+export async function parseChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string }> {
   return getParser(url).fetchChapter(url, opts);
 }
 

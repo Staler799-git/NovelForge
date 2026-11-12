@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { db } from "@/services/db";
 import { generateEpub, generateTxt, generateHtml, type EpubChapter } from "@/services/epub";
-import { pickCoverFromGallery, generatePlaceholderCover } from "@/services/cover";
+import { pickCoverFromGallery, generatePlaceholderCover, readCover } from "@/services/cover";
+import { normalizeLanguage } from "@/services/parser/base";
 import { Filesystem, Directory } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
 import { Haptics, ImpactStyle } from "@capacitor/haptics";
@@ -12,7 +13,7 @@ import { Image as ImageIcon, RotateCw, Share as ShareIcon, FileText, Download as
 
 type SplitMode = "single" | "chapters" | "range";
 
-type ChapterPick = { id: string; title: string; url: string; orderIndex: number; status: string; filePath?: string };
+type ChapterPick = { id: string; title: string; url: string; orderIndex: number; status: string; filePath?: string; checksum?: string };
 
 export function EpubExport() {
   const { id } = useParams<{ id: string }>();
@@ -22,7 +23,10 @@ export function EpubExport() {
   const [coverMime, setCoverMime] = useState("image/jpeg");
   const [title, setTitle] = useState("");
   const [author, setAuthor] = useState("");
-  const [language, setLanguage] = useState("cs");
+  const [language, setLanguage] = useState("en");
+  const [skipDuplicates, setSkipDuplicates] = useState(true);
+  const [stats, setStats] = useState<{ downloaded: number; total: number; duplicates: number } | null>(null);
+  const [notice, setNotice] = useState("");
   const [description, setDescription] = useState("");
   const [split, setSplit] = useState<SplitMode>("single");
   const [chapterCount, setChapterCount] = useState(50);
@@ -30,7 +34,7 @@ export function EpubExport() {
   const [format, setFormat] = useState<"epub" | "txt" | "html">("epub");
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [result, setResult] = useState<{ path: string; size: number } | null>(null);
+  const [result, setResult] = useState<{ path: string; size: number; chapterCount?: number } | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -46,6 +50,9 @@ export function EpubExport() {
         setLanguage(p.language);
         setDescription(p.description ?? "");
       }
+      const all = await db.getChapters(id);
+      const done = all.filter((c) => c.status === "downloaded");
+      if (mounted) setStats({ downloaded: done.length, total: all.length, duplicates: done.length - dedupeByContent(done).length });
     };
     load();
     return () => { mounted = false; };
@@ -55,24 +62,27 @@ export function EpubExport() {
     const picked = await pickCoverFromGallery();
     if (picked) {
       setCoverBase64(picked.base64);
-      setCoverMime("image/jpeg");
+      setCoverMime(picked.mime);
+      if (project) {
+        await db.updateProject(project.id, { coverPath: picked.path });
+        setProject({ ...project, coverPath: picked.path });
+      }
     }
   };
 
   const makePlaceholder = async () => {
     if (!project) return;
     const p = await generatePlaceholderCover(project.title, `cover-${crypto.randomUUID()}.svg`);
-    const res = await Filesystem.readFile({ path: p, directory: Directory.Documents });
-    const data = typeof res.data === "string" ? res.data : "";
-    setCoverBase64(data || null);
-    setCoverMime("image/svg+xml");
+    const data = await readCover(p);
+    setCoverBase64(data?.base64 ?? null);
+    setCoverMime(data?.mime ?? "image/svg+xml");
   };
 
   const buildProject = (): Project => ({
     ...project!,
     title,
     author,
-    language,
+    language: normalizeLanguage(language, "en"),
     description,
   });
 
@@ -80,19 +90,22 @@ export function EpubExport() {
     if (!project) return;
     setGenerating(true);
     setError("");
-    setProgress(10);
+    setNotice("");
+    setResult(null);
+    setProgress(5);
     try {
       const p = buildProject();
       await db.updateProject(p.id, { title: p.title, author: p.author, language: p.language, description: p.description });
 
+      // Obálka: ručně zvolená má přednost, jinak uložená obálka projektu.
+      // MIME typ se určuje ze skutečného obsahu souboru, ne z přípony.
       let coverToUse = coverBase64 ?? undefined;
-      if (!coverToUse && project.coverPath) {
-        try {
-          const res = await Filesystem.readFile({ path: project.coverPath, directory: Directory.Documents });
-          coverToUse = typeof res.data === "string" ? res.data : "";
-          setCoverMime(project.coverPath.endsWith(".svg") ? "image/svg+xml" : "image/jpeg");
-        } catch {
-          /* no cover */
+      let mimeToUse = coverMime;
+      if (!coverToUse) {
+        const stored = await readCover(project.coverPath);
+        if (stored) {
+          coverToUse = stored.base64;
+          mimeToUse = stored.mime;
         }
       }
 
@@ -103,12 +116,25 @@ export function EpubExport() {
         return;
       }
 
-      const selected = selectChapters(downloaded, split, chapterCount, customRange);
-      setProgress(40);
+      const pool = skipDuplicates ? dedupeByContent(downloaded) : downloaded;
+      const selected = selectChapters(pool, split, chapterCount, customRange);
+      if (selected.length === 0) {
+        setError("Zvolený rozsah neobsahuje žádnou staženou kapitolu.");
+        return;
+      }
+      setProgress(15);
 
       let out;
       if (format === "epub") {
-        out = await generateEpub(p, selected, coverToUse, coverMime);
+        const res = await generateEpub(p, selected, coverToUse, mimeToUse, (done, total) =>
+          setProgress(15 + Math.round((done / total) * 75)),
+        );
+        out = res;
+        const notes: string[] = [];
+        if (!coverToUse) notes.push("Kniha nemá obálku.");
+        if (res.missing.length) notes.push(`${res.missing.length} kapitol nemělo uložený text a v knize chybí (např. ${res.missing.slice(0, 3).join(", ")}).`);
+        if (downloaded.length < chapters.length) notes.push(`Kniha obsahuje jen stažené kapitoly (${downloaded.length} z ${chapters.length}).`);
+        setNotice(notes.join(" "));
       } else if (format === "txt") {
         out = await generateTxt(p, selected);
       } else {
@@ -119,6 +145,7 @@ export function EpubExport() {
       await Haptics.impact({ style: ImpactStyle.Medium });
     } catch (err: any) {
       setError(err?.message ?? "Export selhal.");
+      setProgress(0);
     } finally {
       setGenerating(false);
     }
@@ -161,9 +188,6 @@ export function EpubExport() {
                       <ImageIcon size={24} />
                     </div>
                   )}
-                  <button onClick={pickCover} className="absolute bottom-0 right-0 bg-pink-600 rounded-full p-2 opacity-0 group-hover:opacity-100 transition-opacity" title="Změnit obálku">
-                    <ImageIcon size={14} className="text-white" />
-                  </button>
                 </div>
                 <div className="flex-1 space-y-3">
                   <div>
@@ -175,8 +199,8 @@ export function EpubExport() {
                     <Input value={author} onChange={(e) => setAuthor(e.target.value)} />
                   </div>
                   <div>
-                    <div className="text-white/50 text-xs uppercase tracking-wider">Jazyk</div>
-                    <Input value={language} onChange={(e) => setLanguage(e.target.value)} />
+                    <div className="text-white/50 text-xs uppercase tracking-wider">Jazyk (kód, např. en, cs)</div>
+                    <Input value={language} autoCapitalize="off" onChange={(e) => setLanguage(e.target.value)} />
                   </div>
                   <div>
                     <div className="text-white/50 text-xs uppercase tracking-wider">Popis</div>
@@ -243,6 +267,26 @@ export function EpubExport() {
             </div>
           </Card>
 
+          {stats && (
+            <Card>
+              <div className="text-sm text-white/80">
+                Stažených kapitol: <strong className="text-white">{stats.downloaded}</strong> z {stats.total}
+              </div>
+              {stats.downloaded < stats.total && (
+                <div className="mt-1 text-xs text-amber-400">Kniha bude obsahovat jen stažené kapitoly, ve správném pořadí.</div>
+              )}
+              {stats.duplicates > 0 && (
+                <label className="mt-3 flex items-start gap-2 cursor-pointer">
+                  <input type="checkbox" checked={skipDuplicates} onChange={(e) => setSkipDuplicates(e.target.checked)} className="mt-1" />
+                  <span className="text-sm text-white">
+                    Vynechat {stats.duplicates} kapitol se shodným textem
+                    <span className="block text-xs text-white/50">Mají stejný obsah jako dřívější kapitola (porovnává se otisk normalizovaného textu).</span>
+                  </span>
+                </label>
+              )}
+            </Card>
+          )}
+
           <div className="flex gap-3">
             <Button variant="ghost" onClick={() => navigate(`/project/${project.id}`)}>Zpět</Button>
             <Button className="w-full md:w-auto" disabled={generating} onClick={generate}>
@@ -252,6 +296,10 @@ export function EpubExport() {
 
           {error && (
             <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm">{error}</div>
+          )}
+
+          {notice && (
+            <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-sm">{notice}</div>
           )}
 
           {progress > 0 && progress < 100 && (
@@ -266,12 +314,15 @@ export function EpubExport() {
               <div className="p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <div className="text-white font-semibold">{result.path}</div>
-                    <div className="text-white/50 text-xs">{result.size ? (result.size / 1024).toFixed(1) + " kB" : ""}</div>
+                    <div className="text-white font-semibold break-all">{result.path.split("/").pop()}</div>
+                    <div className="text-white/50 text-xs">
+                      {result.chapterCount ? `${result.chapterCount} kapitol · ` : ""}
+                      {result.size ? (result.size / 1024 / 1024).toFixed(2) + " MB" : ""}
+                    </div>
                   </div>
                 </div>
                 <div className="mt-4 flex gap-3">
-                  <Button onClick={share} className="flex-1"><ShareIcon size={18} className="mr-2" /> Sdílet (Soubory / čtečka)</Button>
+                  <Button onClick={share} className="flex-1"><ShareIcon size={18} className="mr-2" /> Sdílet / otevřít ve čtečce</Button>
                   <Button variant="ghost" onClick={() => navigate("/library")} className="flex-1">Hotovo</Button>
                 </div>
               </div>
@@ -283,6 +334,25 @@ export function EpubExport() {
       )}
     </div>
   );
+}
+
+/**
+ * Vynechá kapitoly, jejichž NORMALIZOVANÝ text je shodný s dřívější kapitolou
+ * (stejný otisk obsahu). Ponechá první výskyt; pořadí se nemění.
+ * Kapitoly bez otisku (stažené starší verzí) se nikdy nevynechávají.
+ */
+export function dedupeByContent<T extends { checksum?: string; orderIndex: number }>(chapters: T[]): T[] {
+  const seen = new Set<string>();
+  return chapters
+    .slice()
+    .sort((a, b) => a.orderIndex - b.orderIndex)
+    .filter((c) => {
+      // otisk obsahu má 16 hex znaků; starší 8znakový otisk zahrnoval i název
+      if (!c.checksum || c.checksum.length !== 16) return true;
+      if (seen.has(c.checksum)) return false;
+      seen.add(c.checksum);
+      return true;
+    });
 }
 
 function selectChapters(

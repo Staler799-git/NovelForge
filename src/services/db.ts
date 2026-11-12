@@ -1,5 +1,6 @@
 import { CapacitorSQLite } from "@capacitor-community/sqlite";
 import type { Project, Chapter, ProjectSettings, ChapterStatus, ProjectStatus } from "@/types";
+import { hash64 } from "./content";
 
 const DB_NAME = "novelforge";
 
@@ -63,7 +64,7 @@ export interface Database {
   deleteProject(id: string): Promise<void>;
   getChapters(projectId: string): Promise<Chapter[]>;
   getChapter(id: string): Promise<Chapter | null>;
-  upsertChapters(projectId: string, chapters: Array<Omit<Chapter, "id" | "projectId" | "status">>): Promise<void>;
+  upsertChapters(projectId: string, chapters: Array<Pick<Chapter, "title" | "url" | "orderIndex">>): Promise<void>;
   updateChapter(id: string, patch: Partial<Chapter>): Promise<void>;
   deleteChapters(projectId: string): Promise<void>;
   getChapterStats(projectId: string): Promise<{ total: number; downloaded: number; failed: number }>;
@@ -75,7 +76,7 @@ function rowToProject(row: Record<string, unknown>): Project {
     id: String(row.id),
     title: String(row.title),
     author: String(row.author ?? ""),
-    language: String(row.language ?? "cs"),
+    language: String(row.language || "en"),
     description: row.description ? String(row.description) : undefined,
     sourceUrl: String(row.source_url),
     sourceDomain: row.source_domain ? String(row.source_domain) : undefined,
@@ -116,37 +117,76 @@ function rowToChapter(row: Record<string, unknown>): Chapter {
   };
 }
 
-function hashString(s: string): string {
-  const enc = new TextEncoder();
-  let h = 2166136261 >>> 0;
-  for (const b of enc.encode(s)) {
-    h ^= b;
-    h = (h * 16777619) >>> 0;
-  }
-  return h.toString(16).padStart(8, "0");
+function placeholders(n: number): string {
+  return Array.from({ length: n }, () => "?").join(",");
+}
+
+/**
+ * ID kapitoly = projekt + otisk URL.
+ *
+ * Dřív bylo ID jen 32bitový otisk URL. Stejná novela přidaná podruhé tak
+ * dostala STEJNÁ ID kapitol jako první projekt – `ON CONFLICT(id)` řádky jen
+ * přepsal a nechal je patřit starému projektu, takže nový projekt neměl žádné
+ * kapitoly. Navíc hrozily kolize 32bitového otisku u tisíců kapitol.
+ */
+export function chapterId(projectId: string, url: string): string {
+  return `${projectId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12)}-${hash64(url)}`;
 }
 
 async function exec(statements: string): Promise<void> {
-  await CapacitorSQLite.execute({ database: DB_NAME, statements });
+  await CapacitorSQLite.execute({ database: DB_NAME, statements, transaction: false });
 }
 
+/** Zápis (INSERT/UPDATE/DELETE). Chyba SQL se propaguje jako výjimka s textem chyby. */
 async function run(sql: string, values: unknown[] = []): Promise<void> {
-  await CapacitorSQLite.query({ database: DB_NAME, statement: sql, values });
+  await CapacitorSQLite.run({ database: DB_NAME, statement: sql, values, transaction: false });
 }
 
+/**
+ * Čtení. Na iOS vrací plugin jako PRVNÍ prvek pomocný záznam
+ * `{ ios_columns: [...] }` (pořadí sloupců) – ten není datový řádek a musí se
+ * odfiltrovat, jinak vznikne "prázdný" projekt/kapitola a počty jsou NaN.
+ */
 async function query<T = Record<string, unknown>>(sql: string, values: unknown[] = []): Promise<T[]> {
   const res = await CapacitorSQLite.query({ database: DB_NAME, statement: sql, values });
-  return (res.values ?? []) as T[];
+  const rows = (res.values ?? []) as Array<Record<string, unknown>>;
+  return rows.filter((r) => r && !Object.prototype.hasOwnProperty.call(r, "ios_columns")) as T[];
 }
 
 export class CapacitorDatabase implements Database {
-  async init(): Promise<void> {
-    await CapacitorSQLite.createConnection({
-      database: DB_NAME,
-      encrypted: false,
-      mode: "no-encryption",
-      version: 1,
-    });
+  private ready: Promise<void> | null = null;
+
+  /**
+   * Otevře databázi. Volání je IDEMPOTENTNÍ – lze ho volat opakovaně.
+   *
+   * Nativní `createConnection` při druhém volání vyhodí "Connection novelforge
+   * already exists". Dřív se init() volal při startu aplikace a ZNOVU před
+   * každým stahováním, takže druhé volání vždy spadlo a stahování se nikdy
+   * nerozběhlo (průběh zůstal na 0 %).
+   */
+  init(): Promise<void> {
+    if (!this.ready) {
+      this.ready = this.open().catch((err) => {
+        this.ready = null; // příští volání to zkusí znovu
+        throw err;
+      });
+    }
+    return this.ready;
+  }
+
+  private async open(): Promise<void> {
+    try {
+      await CapacitorSQLite.createConnection({
+        database: DB_NAME,
+        encrypted: false,
+        mode: "no-encryption",
+        version: 1,
+        readonly: false,
+      });
+    } catch (err: any) {
+      // Spojení přežilo z předchozího načtení WebView – to není chyba.
+      if (!/already exists/i.test(String(err?.message ?? err))) throw err;
+    }
     await CapacitorSQLite.open({ database: DB_NAME, readonly: false });
     for (const stmt of MIGRATIONS) {
       await exec(stmt);
@@ -173,7 +213,7 @@ export class CapacitorDatabase implements Database {
         cover_path, total_chapters, downloaded_chapters, failed_chapters, last_downloaded_chapter,
         status, progress, created_at, updated_at, last_check_at, epub_path,
         concurrent_requests, delay_ms, max_retries)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (${placeholders(21)})`,
       [
         id,
         project.title,
@@ -236,6 +276,8 @@ export class CapacitorDatabase implements Database {
   }
 
   async deleteProject(id: string): Promise<void> {
+    // Kapitoly mažeme výslovně – ON DELETE CASCADE platí jen se zapnutými cizími klíči.
+    await run("DELETE FROM chapters WHERE project_id = ?", [id]);
     await run("DELETE FROM projects WHERE id = ?", [id]);
   }
 
@@ -253,18 +295,27 @@ export class CapacitorDatabase implements Database {
     return rowToChapter(rows[0]);
   }
 
+  /**
+   * Vloží kapitoly projektu po dávkách (jeden INSERT na 80 řádků).
+   * Tisíce kapitol by po jedné znamenaly tisíce volání nativního mostu.
+   * Stav už stažených kapitol se při opakovaném vložení NEMĚNÍ.
+   */
   async upsertChapters(
     projectId: string,
-    chapters: Array<Omit<Chapter, "id" | "projectId" | "status">>
+    chapters: Array<Pick<Chapter, "title" | "url" | "orderIndex">>
   ): Promise<void> {
-    if (!chapters.length) return;
-    for (const ch of chapters) {
-      const id = hashString(ch.url);
+    const BATCH = 80;
+    for (let i = 0; i < chapters.length; i += BATCH) {
+      const batch = chapters.slice(i, i + BATCH);
+      const values: unknown[] = [];
+      for (const ch of batch) {
+        values.push(chapterId(projectId, ch.url), projectId, ch.title, ch.url, ch.orderIndex);
+      }
       await run(
         `INSERT INTO chapters (id, project_id, title, url, order_index, status)
-         VALUES (?,?,?,?,?,"pending")
+         VALUES ${batch.map(() => "(?,?,?,?,?,'pending')").join(",")}
          ON CONFLICT(id) DO UPDATE SET title=excluded.title, url=excluded.url, order_index=excluded.order_index`,
-        [id, projectId, ch.title, ch.url, ch.orderIndex]
+        values
       );
     }
   }
@@ -324,6 +375,7 @@ export class CapacitorDatabase implements Database {
     } catch {
       /* ignore */
     }
+    this.ready = null;
   }
 }
 

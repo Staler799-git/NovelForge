@@ -10,6 +10,8 @@ export interface NovelMetadata {
   coverUrl?: string;
   sourceUrl: string;
   sourceDomain?: string;
+  /** Počet kapitol, který uvádí sám web (pokud ho stránka obsahuje). */
+  declaredChapters?: number;
 }
 
 export interface Chapter {
@@ -21,6 +23,7 @@ export interface Chapter {
   status: ChapterStatus;
   filePath?: string;
   fileSize?: number;
+  /** Otisk NORMALIZOVANÉHO textu kapitoly – slouží k rozpoznání duplicitního obsahu. */
   checksum?: string;
   wordCount?: number;
   errorMessage?: string;
@@ -68,8 +71,32 @@ export interface ParserChapter {
   title: string;
   url: string;
   orderIndex: number;
+  /** Pořadové číslo, které u položky zobrazuje katalog (např. "001" nebo "1"). */
+  label?: string;
+  /** Stránka katalogu, na které byla položka nalezena. */
+  page?: number;
+}
+
+export interface CatalogProgress {
+  pagesLoaded: number;
+  /** Známý počet stránek (z odkazů stránkování), pokud jde zjistit. */
+  pagesTotal?: number;
+  chaptersFound: number;
 }
 
 export interface FetchOptions {
   signal?: AbortSignal;
+  onProgress?: (p: CatalogProgress) => void;
+}
+
+/** Výsledek načtení celého katalogu kapitol. */
+export interface CatalogResult {
+  chapters: ParserChapter[];
+  pagesLoaded: number;
+  declaredTotal?: number;
+  /** false = katalog prokazatelně není celý (selhala stránka, přerušeno, nesedí počet). */
+  complete: boolean;
+  /** true = detekci zastavil uživatel. */
+  aborted: boolean;
+  warnings: string[];
 }

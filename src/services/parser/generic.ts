@@ -1,5 +1,6 @@
-import { NovelParser, cleanText, extractTitle } from "./base";
-import type { NovelMetadata, ParserChapter } from "@/types";
+import { NovelParser, ContentError, cleanText, extractTitle, findCoverUrl, detectLanguage } from "./base";
+import type { NovelMetadata, ParserChapter, FetchOptions } from "@/types";
+import { sanitizeToXhtml, assertChapterContent } from "@/services/content";
 
 const CHAPTER_KEYWORDS = [
   "kapitola", "chapter", "díl", "dil", "díly", "dily", "část", "cast",
@@ -27,20 +28,20 @@ export class GenericNovelParser extends NovelParser {
     return true;
   }
 
-  async fetchMetadata(url: string): Promise<NovelMetadata> {
-    const html = await this.fetchHtml(url);
+  async fetchMetadata(url: string, opts?: FetchOptions): Promise<NovelMetadata> {
+    const html = await this.fetchHtml(url, opts);
     const doc = this.parseHtml(html);
     const title = cleanText(this.og(doc, "title") || extractTitle(doc) || "Neznámá novela");
     const author = cleanText(this.meta(doc, "author") ?? this.findAuthor(doc) ?? "");
     const description = this.og(doc, "description") || this.meta(doc, "description") || undefined;
-    const coverUrl = this.og(doc, "image") || this.og(doc, "image:url") || undefined;
-    const language = doc.documentElement.lang || "cs";
+    const coverUrl = findCoverUrl(doc, url);
+    const language = detectLanguage(doc, `${title} ${description ?? ""}`);
     return {
       title,
       author,
       description,
       language,
-      coverUrl: coverUrl ? this.absoluteUrl(url, coverUrl) : undefined,
+      coverUrl,
       sourceUrl: url,
       sourceDomain: new URL(url).hostname,
     };
@@ -62,8 +63,8 @@ export class GenericNovelParser extends NovelParser {
     return null;
   }
 
-  async fetchChapterList(url: string): Promise<ParserChapter[]> {
-    const html = await this.fetchHtml(url);
+  async fetchChapterList(url: string, opts?: FetchOptions): Promise<ParserChapter[]> {
+    const html = await this.fetchHtml(url, opts);
     const doc = this.parseHtml(html);
     const links = Array.from(doc.querySelectorAll("a[href]"));
     const seen = new Set<string>();
@@ -109,12 +110,15 @@ export class GenericNovelParser extends NovelParser {
     return chapters;
   }
 
-  async fetchChapter(url: string): Promise<{ title: string; html: string }> {
-    const html = await this.fetchHtml(url);
+  async fetchChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string }> {
+    const html = await this.fetchHtml(url, opts);
     const doc = this.parseHtml(html);
     const title = cleanText(extractTitle(doc) || "Kapitola");
     const content = this.selectContent(doc);
-    return { title, html: this.cleanContent(content) };
+    if (!content) throw new ContentError("Na stránce nebyl nalezen text kapitoly");
+    const cleaned = this.cleanContent(content);
+    assertChapterContent(cleaned);
+    return { title, html: cleaned };
   }
 
   private selectContent(doc: Document): Element {
@@ -152,8 +156,7 @@ export class GenericNovelParser extends NovelParser {
     for (const el of clone.querySelectorAll("p, div")) {
       if (!el.textContent?.trim() && !el.querySelector("img, br")) el.remove();
     }
-    let html = clone.innerHTML.replace(/<!--[\s\S]*?-->/g, "");
-    return html.trim();
+    return sanitizeToXhtml(clone.innerHTML);
   }
 }
 

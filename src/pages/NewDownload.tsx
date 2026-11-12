@@ -1,122 +1,261 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { parseMetadata, parseChapterList } from "@/services/parser/registry";
+import { parseMetadata, parseCatalog, parseChapter } from "@/services/parser/registry";
 import { db } from "@/services/db";
 import { downloadManager } from "@/services/downloader";
 import { storage } from "@/services/storage";
-import { generatePlaceholderCover } from "@/services/cover";
+import { projectStore } from "@/store";
+import { isAbort } from "@/services/http";
+import { analyzeCatalog, compareSeries, findGaps, type SeriesComparison } from "@/services/catalog";
+import { generatePlaceholderCover, downloadCover, saveCover, pickCoverFromGallery, coverDataUri, type CoverData } from "@/services/cover";
+import type { CatalogProgress, CatalogResult, NovelMetadata, ParserChapter } from "@/types";
 import { Card, SectionTitle, Button, Input, Textarea, Badge, ProgressBar } from "@/components/ui";
-import { Search, AlertTriangle, List, ChevronRight } from "lucide-react";
+import { Search, AlertTriangle, List, ChevronRight, Square, Image as ImageIcon, Loader2 } from "lucide-react";
 
 type Step = "url" | "preview";
+type SeriesChoice = "A" | "B" | "all";
+
+const PAGE_SIZE = 200;
 
 export function NewDownload() {
   const navigate = useNavigate();
   const [step, setStep] = useState<Step>("url");
   const [url, setUrl] = useState("");
-  const [meta, setMeta] = useState<{ title: string; author: string; description?: string; language?: string; coverUrl?: string; sourceUrl: string; sourceDomain?: string } | null>(null);
-  const [chapters, setChapters] = useState<{ title: string; url: string; orderIndex: number }[]>([]);
+  const [meta, setMeta] = useState<NovelMetadata | null>(null);
+  const [catalog, setCatalog] = useState<CatalogResult | null>(null);
+  const [seriesChoice, setSeriesChoice] = useState<SeriesChoice>("all");
+  const [comparison, setComparison] = useState<SeriesComparison | null>(null);
+  const [comparing, setComparing] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState(false);
+  const [visible, setVisible] = useState(PAGE_SIZE);
+  const [rangeFrom, setRangeFrom] = useState("");
+  const [rangeTo, setRangeTo] = useState("");
+  const [detecting, setDetecting] = useState(false);
+  const [detectProgress, setDetectProgress] = useState<CatalogProgress | null>(null);
+  const [phase, setPhase] = useState("");
   const [error, setError] = useState("");
-  const [downloading, setDownloading] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [log, setLog] = useState<string[]>([]);
+  const [starting, setStarting] = useState(false);
+  const [cover, setCover] = useState<CoverData | null>(null);
+  const [coverPath, setCoverPath] = useState<string | null>(null);
+  const [coverNote, setCoverNote] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const allChapters = catalog?.chapters ?? [];
+  const analysis = useMemo(() => analyzeCatalog(allChapters), [allChapters]);
+
+  /** Kapitoly zvolené řady, v pořadí katalogu. */
+  const chapters: ParserChapter[] = useMemo(() => {
+    if (analysis.series.length < 2 || seriesChoice === "all") return allChapters;
+    const urls = new Set(analysis.series.find((s) => s.id === seriesChoice)?.urls ?? []);
+    return allChapters.filter((c) => urls.has(c.url));
+  }, [allChapters, analysis, seriesChoice]);
+
+  const gaps = useMemo(() => findGaps(chapters), [chapters]);
+  const selectedCount = useMemo(() => chapters.filter((c) => selected.has(c.url)).length, [chapters, selected]);
+
+  const loadCover = useCallback(async (m: NovelMetadata, signal: AbortSignal) => {
+    setCover(null);
+    setCoverPath(null);
+    if (!m.coverUrl) {
+      setCoverNote("Web neposkytl obálku. Můžete ji vybrat z galerie.");
+      return;
+    }
+    setCoverNote("Stahuji obálku…");
+    try {
+      const data = await downloadCover(m.coverUrl, m.sourceUrl, signal);
+      if (!mounted.current) return;
+      setCover(data);
+      setCoverNote("");
+    } catch (err: any) {
+      if (!mounted.current || isAbort(err)) return;
+      setCoverNote(`${err?.message ?? "Obálku se nepodařilo stáhnout"}. Můžete ji vybrat z galerie.`);
+    }
+  }, []);
+
+  const applyCatalog = useCallback((result: CatalogResult) => {
+    setCatalog(result);
+    const a = analyzeCatalog(result.chapters);
+    // Dvě řady se nikdy nemíchají automaticky: předvybere se řada s názvy
+    // kapitol (nebo větší), uživatel může volbu změnit.
+    let choice: SeriesChoice = "all";
+    if (a.series.length >= 2) {
+      const [sa, sb] = a.series;
+      choice = sb.count >= sa.count * 0.9 ? "B" : "A";
+    }
+    setSeriesChoice(choice);
+    const urls = choice === "all" ? result.chapters.map((c) => c.url) : (a.series.find((s) => s.id === choice)?.urls ?? []);
+    setSelected(new Set(urls));
+    setVisible(PAGE_SIZE);
+    setRangeFrom("");
+    setRangeTo("");
+    setComparison(null);
+  }, []);
 
   const fetchNovel = useCallback(async () => {
-    if (!url.trim()) return;
-    setLoading(true);
+    const target = url.trim();
+    if (!target) return;
+    if (!/^https?:\/\//i.test(target)) {
+      setError("Zadejte celou adresu včetně https://");
+      return;
+    }
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setDetecting(true);
     setError("");
+    setDetectProgress(null);
+    setCatalog(null);
+    setMeta(null);
+    setPhase("Načítám stránku novely…");
     try {
-      const [m, ch] = await Promise.all([parseMetadata(url), parseChapterList(url)]);
+      const m = await parseMetadata(target, { signal: ctrl.signal });
+      if (!mounted.current) return;
       setMeta(m);
-      setChapters(ch);
-      setSelected(new Set(ch.map((c) => c.url)));
+      void loadCover(m, ctrl.signal);
+      setPhase("Načítám katalog kapitol…");
+      const result = await parseCatalog(target, {
+        signal: ctrl.signal,
+        onProgress: (p) => mounted.current && setDetectProgress(p),
+      });
+      if (!mounted.current) return;
+      if (result.chapters.length === 0) {
+        setError(
+          result.aborted
+            ? "Detekce byla zastavena dřív, než se našly kapitoly."
+            : "Na stránce nebyly nalezeny žádné kapitoly. Zkontrolujte, že adresa vede na stránku novely.",
+        );
+        return;
+      }
+      applyCatalog({ ...result, declaredTotal: result.declaredTotal ?? m.declaredChapters });
       setStep("preview");
     } catch (err: any) {
-      setError(err?.message ?? "Nepodařilo se načíst stránku. Zkontrolujte URL a připojení.");
+      if (!mounted.current) return;
+      setError(isAbort(err) ? "Detekce byla zastavena." : `Novelu se nepodařilo načíst: ${err?.message ?? "neznámá chyba"}`);
     } finally {
-      setLoading(false);
+      if (mounted.current) {
+        setDetecting(false);
+        setPhase("");
+      }
     }
-  }, [url]);
+  }, [url, loadCover, applyCatalog]);
 
-  const toggleAll = useCallback(() => {
-    const all = chapters.every((c) => selected.has(c.url));
-    setSelected(all ? new Set() : new Set(chapters.map((c) => c.url)));
-  }, [chapters, selected]);
+  const stopDetection = () => abortRef.current?.abort();
+
+  const chooseSeries = (choice: SeriesChoice) => {
+    setSeriesChoice(choice);
+    const urls = choice === "all" ? allChapters.map((c) => c.url) : (analysis.series.find((s) => s.id === choice)?.urls ?? []);
+    setSelected(new Set(urls));
+    setVisible(PAGE_SIZE);
+  };
+
+  const runComparison = async () => {
+    if (analysis.series.length < 2) return;
+    setComparing(true);
+    setComparison(null);
+    try {
+      setComparison(await compareSeries(allChapters, analysis.series[0], analysis.series[1], (u) => parseChapter(u)));
+    } catch (err: any) {
+      setComparison({ verdict: "unknown", similarity: 0, pairs: [], message: `Porovnání se nezdařilo: ${err?.message ?? "neznámá chyba"}` });
+    } finally {
+      setComparing(false);
+    }
+  };
+
+  const toggleAll = () => {
+    setSelected(selectedCount === chapters.length ? new Set() : new Set(chapters.map((c) => c.url)));
+  };
+
+  const applyRange = () => {
+    const from = Math.max(1, parseInt(rangeFrom || "1", 10) || 1);
+    const to = Math.min(chapters.length, parseInt(rangeTo || String(chapters.length), 10) || chapters.length);
+    if (from > to) return;
+    setSelected(new Set(chapters.slice(from - 1, to).map((c) => c.url)));
+  };
+
+  const pickCover = async () => {
+    const picked = await pickCoverFromGallery();
+    if (!picked) return;
+    setCover({ base64: picked.base64, mime: picked.mime });
+    setCoverPath(picked.path);
+    setCoverNote("");
+  };
 
   const startDownload = async () => {
-    if (!meta) return;
-    setLoading(true);
-    setDownloading(true);
-    setProgress(0);
-    setLog([]);
+    if (!meta || starting) return;
+    const toInsert = chapters.filter((c) => selected.has(c.url));
+    if (toInsert.length === 0) return;
+    setStarting(true);
+    setError("");
     try {
       await storage.init();
       await db.init();
 
-      // Resolve cover to a local file
-      let coverPath: string | undefined;
-      const coverFile = `cover-${crypto.randomUUID()}`;
-      if (meta.coverUrl) {
+      let finalCover = coverPath ?? undefined;
+      if (!finalCover && cover) {
         try {
-          const res = await fetch(meta.coverUrl);
-          if (res.ok) {
-            const arr = await res.arrayBuffer();
-            const base64 = btoa(String.fromCharCode(...new Uint8Array(arr)));
-            const ext = (meta.coverUrl.match(/\.(jpg|jpeg|png|webp)(\?|$)/i) ?? ["jpg"])[0].replace(".", "");
-            const path = `NovelForge/covers/${coverFile}.${ext}`;
-            const { Filesystem, Directory, Encoding } = await import("@capacitor/filesystem");
-            await Filesystem.writeFile({ path, data: base64, directory: Directory.Documents, encoding: Encoding.UTF8 });
-            coverPath = path;
-          }
-        } catch {
-          /* cover optional */
+          finalCover = await saveCover(cover);
+        } catch (err) {
+          console.warn("Uložení obálky selhalo", err);
         }
       }
-      if (!coverPath) {
+      if (!finalCover) {
         try {
-          coverPath = await generatePlaceholderCover(meta.title, `${coverFile}.svg`);
+          finalCover = await generatePlaceholderCover(meta.title, `cover-${crypto.randomUUID()}.svg`);
         } catch {
-          /* no cover */
+          /* kniha může být i bez obálky */
         }
       }
 
       const project = await db.createProject({
-        title: meta.title,
-        author: meta.author,
-        language: meta.language ?? "cs",
+        title: meta.title.trim() || "Bez názvu",
+        author: meta.author.trim(),
+        language: (meta.language ?? "en").trim() || "en",
         description: meta.description,
         sourceUrl: meta.sourceUrl,
         sourceDomain: meta.sourceDomain,
-        coverPath,
-        totalChapters: chapters.length,
+        coverPath: finalCover,
+        totalChapters: toInsert.length,
         downloadedChapters: 0,
         failedChapters: 0,
         status: "idle",
         progress: 0,
       });
 
-      const toInsert = chapters.filter((c) => selected.has(c.url));
-      await db.upsertChapters(project.id, toInsert);
+      // Pořadí = pořadí katalogu; indexy se přečíslují souvisle pro vybranou množinu.
+      await db.upsertChapters(
+        project.id,
+        toInsert.map((c, i) => ({ title: c.title, url: c.url, orderIndex: i })),
+      );
 
-      const sub = downloadManager.on((e) => {
-        if (e.type === "log") setLog((prev) => [...prev.slice(-49), e.message]);
-        if (e.type === "progress") setProgress(e.progress);
-        if (e.type === "project-end") {
-          setDownloading(false);
-          sub();
-          if (e.ok) navigate(`/project/${project.id}`);
-        }
-      });
-
-      await downloadManager.startProject(project);
+      // Stahování běží na pozadí – průběh ukazuje detail projektu.
+      void downloadManager.startProject(project);
+      void projectStore.refresh();
+      navigate(`/project/${project.id}`);
     } catch (err: any) {
-      setError(err?.message ?? "Stahování se nepodařilo spustit.");
-    } finally {
-      setLoading(false);
+      setError(`Stahování se nepodařilo spustit: ${err?.message ?? "neznámá chyba"}`);
+      setStarting(false);
     }
   };
+
+  const pagesText = detectProgress
+    ? `Stránka ${detectProgress.pagesLoaded}${detectProgress.pagesTotal ? ` z ${detectProgress.pagesTotal}` : ""}`
+    : "";
+  const detectPct =
+    detectProgress?.pagesTotal ? Math.min(100, Math.round((detectProgress.pagesLoaded / detectProgress.pagesTotal) * 100)) : 0;
+
+  const errorBox = error && (
+    <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm flex gap-2" role="alert">
+      <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" /> <span>{error}</span>
+    </div>
+  );
 
   return (
     <div className="p-4 space-y-5 max-w-[640px] mx-auto">
@@ -128,121 +267,226 @@ export function NewDownload() {
             <Input
               placeholder="https://www.wuxiabox.com/novel/i-created-the-longevity-club.html"
               value={url}
+              inputMode="url"
+              autoCapitalize="off"
+              autoCorrect="off"
+              disabled={detecting}
               onChange={(e) => setUrl(e.target.value)}
             />
-            <Button className="w-full" onClick={fetchNovel} disabled={loading || !url.trim()}>
-              {loading ? <Search className="mr-2 animate-spin" /> : <Search className="mr-2" />} Detekovat novelu
-            </Button>
-            {error && (
-              <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
-                <AlertTriangle size={16} className="mr-2" /> {error}
+            {!detecting ? (
+              <Button className="w-full" onClick={fetchNovel} disabled={!url.trim()}>
+                <Search size={18} /> Detekovat novelu
+              </Button>
+            ) : (
+              <div className="space-y-3 p-3 rounded-xl bg-white/5 border border-white/10" aria-live="polite">
+                <div className="flex items-center gap-2 text-sm text-white">
+                  <Loader2 size={16} className="animate-spin text-pink-400" />
+                  <span>{phase}</span>
+                </div>
+                {meta && <div className="text-sm text-white/70 truncate">{meta.title}</div>}
+                {detectProgress && (
+                  <>
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-2xl font-bold text-white" data-testid="found-count">{detectProgress.chaptersFound}</span>
+                      <span className="text-xs text-white/50">nalezených kapitol · {pagesText}</span>
+                    </div>
+                    {detectProgress.pagesTotal ? <ProgressBar value={detectPct} className="h-2" /> : null}
+                  </>
+                )}
+                <Button variant="danger" className="w-full" onClick={stopDetection}>
+                  <Square size={16} /> Zastavit detekci
+                </Button>
               </div>
             )}
+            {errorBox}
             <p className="text-xs text-white/40">
-              Podporováno: obecné HTML weby a (přes nativní prohlížeč) stránky vykreslované JavaScriptem.
+              U stránkovaných katalogů (např. WuxiaBox) se načtou všechny stránky seznamu kapitol. Detekci lze kdykoli zastavit.
             </p>
           </div>
         </Card>
       )}
 
-      {step === "preview" && meta && (
+      {step === "preview" && meta && catalog && (
         <>
-          <div className="flex flex-col lg:flex-row gap-6">
-            <div className="lg:w-1/3">
-              <Card>
-                <div className="flex items-center justify-center">
-                  {meta.coverUrl ? (
-                    <img src={meta.coverUrl} alt="" className="w-48 h-64 rounded-2xl object-cover bg-white/5" />
-                  ) : (
-                    <div className="w-48 h-64 rounded-2xl bg-white/5 flex items-center justify-center text-white/20">
-                      <List size={32} />
-                    </div>
-                  )}
-                </div>
-                <div className="mt-3 p-3 rounded-xl bg-white/5 text-xs text-white/50">
-                  Zdroj: {meta.sourceDomain ?? meta.sourceUrl}
-                </div>
-              </Card>
+          <Card>
+            <div className="flex gap-4">
+              <div className="flex-shrink-0">
+                {cover ? (
+                  <img src={coverDataUri(cover.base64, cover.mime)} alt="Obálka" className="w-28 h-40 rounded-xl object-cover bg-white/5 border border-white/10" />
+                ) : (
+                  <div className="w-28 h-40 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-white/20">
+                    <List size={28} />
+                  </div>
+                )}
+              </div>
+              <div className="flex-1 min-w-0 space-y-2">
+                <div className="text-white font-semibold leading-snug">{meta.title}</div>
+                <div className="text-xs text-white/50">Zdroj: {meta.sourceDomain ?? meta.sourceUrl}</div>
+                {coverNote && <div className="text-xs text-amber-400">{coverNote}</div>}
+                <Button variant="ghost" onClick={pickCover}>
+                  <ImageIcon size={16} /> Obálka z galerie
+                </Button>
+              </div>
             </div>
-            <div className="lg:w-2/3 flex-1">
-              <Card>
-                <SectionTitle className="mb-3">Upravit metadata</SectionTitle>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-white/50 text-xs uppercase tracking-wider">Název</div>
-                    <Input defaultValue={meta.title} onChange={(e) => setMeta({ ...meta!, title: e.target.value })} />
-                  </div>
-                  <div>
-                    <div className="text-white/50 text-xs uppercase tracking-wider">Autor</div>
-                    <Input defaultValue={meta.author} onChange={(e) => setMeta({ ...meta!, author: e.target.value })} />
-                  </div>
-                  <div>
-                    <div className="text-white/50 text-xs uppercase tracking-wider">Popis</div>
-                    <Textarea defaultValue={meta.description ?? ""} onChange={(e) => setMeta({ ...meta!, description: e.target.value })} />
-                  </div>
-                  <div>
-                    <div className="text-white/50 text-xs uppercase tracking-wider">Jazyk</div>
-                    <Input defaultValue={meta.language ?? "cs"} onChange={(e) => setMeta({ ...meta!, language: e.target.value })} />
-                  </div>
-                </div>
-              </Card>
+          </Card>
 
-              <Card>
-                <SectionTitle className="mb-3">Kapitoly ({chapters.length})</SectionTitle>
-                <div className="flex items-center justify-between gap-3 mb-3">
-                  <Button variant="ghost" onClick={toggleAll}>
-                    {selected.size === chapters.length ? "Odznačit vše" : "Označit vše"}
-                  </Button>
-                  <Badge variant="muted">Vybráno: {selected.size} / {chapters.length}</Badge>
-                </div>
-                <div className="max-h-[320px] overflow-y-auto space-y-1 p-1 bg-white/[0.03] rounded-xl">
-                  {chapters.map((c) => (
-                    <label key={c.url} className="flex items-center justify-between p-2 rounded-lg cursor-pointer transition hover:bg-white/5 group">
-                      <input
-                        type="checkbox"
-                        className="rounded text-pink-500 focus:ring-pink-500 border-white/20"
-                        checked={selected.has(c.url)}
-                        onChange={() => {
-                          const n = new Set(selected);
-                          if (n.has(c.url)) n.delete(c.url); else n.add(c.url);
-                          setSelected(n);
-                        }}
-                      />
-                      <div className="flex-1 min-w-0 ml-3">
-                        <div className="text-white text-sm truncate">{c.title}</div>
-                        <div className="text-white/40 text-[10px] truncate">{c.url}</div>
-                      </div>
-                    </label>
-                  ))}
-                </div>
-              </Card>
+          <Card>
+            <SectionTitle className="mb-3">Katalog</SectionTitle>
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div className="p-3 rounded-xl bg-white/5">
+                <div className="text-white/40 text-xs">Nalezeno kapitol</div>
+                <div className="text-xl font-bold text-white">{catalog.chapters.length}</div>
+              </div>
+              <div className="p-3 rounded-xl bg-white/5">
+                <div className="text-white/40 text-xs">Web uvádí</div>
+                <div className="text-xl font-bold text-white">{catalog.declaredTotal ?? "—"}</div>
+              </div>
             </div>
-          </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Badge variant={catalog.complete ? "ok" : "warn"}>{catalog.complete ? "Katalog kompletní" : "Katalog NENÍ kompletní"}</Badge>
+              <Badge variant="muted">Stránek katalogu: {catalog.pagesLoaded}</Badge>
+            </div>
+            {catalog.warnings.length > 0 && (
+              <ul className="mt-3 space-y-1 text-xs text-amber-400">
+                {catalog.warnings.map((w, i) => (
+                  <li key={i} className="flex gap-2"><AlertTriangle size={14} className="flex-shrink-0 mt-0.5" /> <span>{w}</span></li>
+                ))}
+              </ul>
+            )}
+            {gaps.reliable && gaps.missingCount > 0 && (
+              <div className="mt-3 text-xs text-amber-400 flex gap-2">
+                <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+                <span>
+                  V číslování chybí {gaps.missingCount} kapitol (např. {gaps.missing.slice(0, 8).join(", ")}
+                  {gaps.missingCount > 8 ? "…" : ""}). Web je možná nemá, nebo je katalog neúplný.
+                </span>
+              </div>
+            )}
+            {gaps.reliable && gaps.missingCount === 0 && (
+              <div className="mt-3 text-xs text-green-400">Číslování {gaps.first}–{gaps.last} je souvislé, žádná kapitola nechybí.</div>
+            )}
+          </Card>
+
+          {analysis.series.length >= 2 && (
+            <Card>
+              <SectionTitle className="mb-2">Dvě číslovací řady</SectionTitle>
+              <p className="text-xs text-white/60 mb-3">
+                Katalog obsahuje {analysis.duplicateNumbers} čísel kapitol dvakrát, pokaždé s jinou adresou. Řady se automaticky
+                nemíchají – vyberte, kterou chcete stáhnout.
+              </p>
+              <div className="space-y-2">
+                {analysis.series.map((s) => (
+                  <label key={s.id} className={`block p-3 rounded-xl border cursor-pointer ${seriesChoice === s.id ? "border-pink-500/60 bg-pink-500/10" : "border-white/10 bg-white/5"}`}>
+                    <div className="flex items-center gap-2">
+                      <input type="radio" name="series" checked={seriesChoice === s.id} onChange={() => chooseSeries(s.id as SeriesChoice)} />
+                      <span className="text-white text-sm font-semibold">{s.label}</span>
+                      <Badge variant="muted">{s.count}</Badge>
+                    </div>
+                    <div className="mt-1 text-[11px] text-white/50 truncate">{s.samples.join("  ·  ")}</div>
+                  </label>
+                ))}
+                <label className={`block p-3 rounded-xl border cursor-pointer ${seriesChoice === "all" ? "border-pink-500/60 bg-pink-500/10" : "border-white/10 bg-white/5"}`}>
+                  <div className="flex items-center gap-2">
+                    <input type="radio" name="series" checked={seriesChoice === "all"} onChange={() => chooseSeries("all")} />
+                    <span className="text-white text-sm font-semibold">Vše v pořadí katalogu</span>
+                    <Badge variant="muted">{allChapters.length}</Badge>
+                  </div>
+                  <div className="mt-1 text-[11px] text-white/50">Obě řady tak, jak je web uvádí. Kniha může obsahovat stejný text dvakrát.</div>
+                </label>
+              </div>
+              <div className="mt-3">
+                <Button variant="ghost" onClick={runComparison} disabled={comparing}>
+                  {comparing ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />} Porovnat obsah řad
+                </Button>
+                {comparison && (
+                  <div className={`mt-2 text-xs ${comparison.verdict === "identical" ? "text-green-400" : "text-amber-400"}`}>
+                    {comparison.message}
+                    {comparison.pairs.map((p) => (
+                      <div key={p.number} className="text-white/50">
+                        č. {p.number}: shoda {Math.round(p.similarity * 100)} %
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </Card>
+          )}
+
+          <Card>
+            <SectionTitle className="mb-3">Metadata</SectionTitle>
+            <div className="space-y-3">
+              <div>
+                <div className="text-white/50 text-xs uppercase tracking-wider">Název</div>
+                <Input value={meta.title} onChange={(e) => setMeta({ ...meta, title: e.target.value })} />
+              </div>
+              <div>
+                <div className="text-white/50 text-xs uppercase tracking-wider">Autor</div>
+                <Input value={meta.author} onChange={(e) => setMeta({ ...meta, author: e.target.value })} />
+              </div>
+              <div>
+                <div className="text-white/50 text-xs uppercase tracking-wider">Jazyk (kód, např. en, cs)</div>
+                <Input value={meta.language ?? ""} autoCapitalize="off" onChange={(e) => setMeta({ ...meta, language: e.target.value })} />
+              </div>
+              <div>
+                <div className="text-white/50 text-xs uppercase tracking-wider">Popis</div>
+                <Textarea value={meta.description ?? ""} onChange={(e) => setMeta({ ...meta, description: e.target.value })} />
+              </div>
+            </div>
+          </Card>
+
+          <Card>
+            <SectionTitle className="mb-3">Kapitoly ({chapters.length})</SectionTitle>
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <Button variant="ghost" onClick={toggleAll}>
+                {selectedCount === chapters.length ? "Odznačit vše" : "Označit vše"}
+              </Button>
+              <Badge variant="muted">Vybráno: {selectedCount} / {chapters.length}</Badge>
+            </div>
+            <div className="flex items-end gap-2 mb-3">
+              <div className="flex-1">
+                <div className="text-white/50 text-xs">Od</div>
+                <Input type="number" inputMode="numeric" placeholder="1" value={rangeFrom} onChange={(e) => setRangeFrom(e.target.value)} />
+              </div>
+              <div className="flex-1">
+                <div className="text-white/50 text-xs">Do</div>
+                <Input type="number" inputMode="numeric" placeholder={String(chapters.length)} value={rangeTo} onChange={(e) => setRangeTo(e.target.value)} />
+              </div>
+              <Button variant="ghost" onClick={applyRange}>Vybrat rozsah</Button>
+            </div>
+            <div className="max-h-[320px] overflow-y-auto space-y-1 p-1 bg-white/[0.03] rounded-xl">
+              {chapters.slice(0, visible).map((c, i) => (
+                <label key={c.url} className="flex items-center p-2 rounded-lg cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(c.url)}
+                    onChange={() => {
+                      const n = new Set(selected);
+                      if (n.has(c.url)) n.delete(c.url); else n.add(c.url);
+                      setSelected(n);
+                    }}
+                  />
+                  <span className="ml-3 w-10 text-right text-white/40 text-xs flex-shrink-0">{i + 1}.</span>
+                  <span className="ml-2 text-white text-sm truncate">{c.title}</span>
+                </label>
+              ))}
+              {visible < chapters.length && (
+                <Button variant="ghost" className="w-full" onClick={() => setVisible((v) => v + 500)}>
+                  Zobrazit dalších {Math.min(500, chapters.length - visible)} (z {chapters.length})
+                </Button>
+              )}
+            </div>
+          </Card>
+
+          {errorBox}
 
           <div className="flex justify-end gap-3">
-            <Button variant="ghost" onClick={() => setStep("url")}>Zpět</Button>
-            <Button className="w-auto" disabled={selected.size === 0 || loading} onClick={startDownload}>
-              {downloading ? <Search className="mr-2 animate-spin" /> : <ChevronRight size={18} className="mr-2" />}
-              Spustit stahování ({selected.size})
+            <Button variant="ghost" disabled={starting} onClick={() => { setStep("url"); setError(""); }}>Zpět</Button>
+            <Button disabled={selectedCount === 0 || starting} onClick={startDownload}>
+              {starting ? <Loader2 size={18} className="animate-spin" /> : <ChevronRight size={18} />}
+              {starting ? "Připravuji…" : `Spustit stahování (${selectedCount})`}
             </Button>
           </div>
         </>
-      )}
-
-      {downloading && step === "preview" && (
-        <Card>
-          <SectionTitle>Stahování běží</SectionTitle>
-          <ProgressBar value={progress} />
-          <div className="text-white/50 text-sm">{progress} % kapitol</div>
-          <div className="mt-3 text-xs text-white/40 space-y-1">
-            {log.slice(-5).map((m, i) => (
-              <div key={i}>• {m}</div>
-            ))}
-          </div>
-          <p className="mt-2 text-xs text-white/50">
-            Pokud aplikaci uzavřete, stahování je možné později obnovit na kartě “Stahování” — hotové kapitoly se nestahují znovu.
-          </p>
-        </Card>
       )}
     </div>
   );
