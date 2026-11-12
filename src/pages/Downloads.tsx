@@ -6,6 +6,7 @@ import { projectStore } from "@/store";
 import type { Project } from "@/types";
 import { Card, SectionTitle, Button, Badge, ProgressBar, Cover } from "@/components/ui";
 import { formatDateShort } from "@/lib/utils";
+import { projectStatusLabel } from "./ProjectDetail";
 import { Download, Pause, Play, RefreshCw, Trash2, Share2, FileText, Clock } from "lucide-react";
 
 export function Downloads() {
@@ -29,7 +30,7 @@ export function Downloads() {
     const sub = downloadManager.on((e) => {
       if (!mounted) return;
       if (e.type === "log") setLogs((prev) => [e.message, ...prev.slice(0, 29)]);
-      if (e.type === "project-end" || e.type === "progress") load();
+      if (e.type === "project-end" || e.type === "project-start" || e.type === "progress") load();
     });
     return () => {
       mounted = false;
@@ -39,8 +40,17 @@ export function Downloads() {
   }, [load]);
 
   const pause = (p: Project) => downloadManager.pauseProject(p.id);
-  const resume = (p: Project) => downloadManager.startProject(p);
-  const retry = (p: Project) => downloadManager.retryFailed(p);
+  // Stahování běží na pozadí – na Promise se nečeká, stav hlásí události.
+  const resume = (p: Project) => { void downloadManager.startProject(p); setTimeout(load, 300); };
+  const retry = (p: Project) => { void downloadManager.retryFailed(p); setTimeout(load, 300); };
+  const remove = async (p: Project) => {
+    if (!window.confirm(`Smazat projekt „${p.title}“ včetně stažených kapitol?`)) return;
+    downloadManager.cancelProject(p.id);
+    await db.deleteProject(p.id);
+    await load();
+  };
+
+  const running = (p: Project) => downloadManager.isDownloading(p.id);
 
   return (
     <div className="p-4 space-y-5 max-w-[700px] mx-auto">
@@ -102,43 +112,50 @@ export function Downloads() {
                     <span>Kapitoly</span>
                     <span>{p.downloadedChapters} / {p.totalChapters}</span>
                   </div>
-                  <ProgressBar value={p.progress} className="h-2.5" />
+                  <ProgressBar value={p.totalChapters ? Math.floor((p.downloadedChapters / p.totalChapters) * 100) : 0} className="h-2.5" />
 
                   <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <Badge variant={p.status === "completed" ? "ok" : p.status === "downloading" ? "warn" : "muted"}>
-                      {statusLabel(p.status)}
+                    <Badge variant={running(p) ? "warn" : p.status === "completed" ? "ok" : p.status === "failed" ? "bad" : "muted"}>
+                      {projectStatusLabel(p, running(p))}
                     </Badge>
-                    {downloadManager.getCurrentChapter(p.id) && (
-                      <Badge variant="muted">{downloadManager.getCurrentChapter(p.id)!.title}</Badge>
-                    )}
                     {p.failedChapters > 0 && <Badge variant="bad">{p.failedChapters} selhalo</Badge>}
                     <span className="text-white/40">{formatDateShort(p.updatedAt)}</span>
                   </div>
+                  {downloadManager.getCurrentChapter(p.id) && (
+                    <div className="text-xs text-white/50 truncate">Aktuálně: {downloadManager.getCurrentChapter(p.id)!.title}</div>
+                  )}
+                  {!running(p) && downloadManager.getLastError(p.id) && (
+                    <div className="text-xs text-red-400">{downloadManager.getLastError(p.id)}</div>
+                  )}
 
-                  <div className="flex gap-2 mt-3">
-                    {p.status === "downloading" && (
-                      <>
-                        <Button variant="ghost" onClick={() => pause(p)}>
-                          <Pause size={16} className="mr-1" /> Pozastavit
-                        </Button>
-                        <Button variant="danger" onClick={() => downloadManager.cancelProject(p.id)}>
-                          <Trash2 size={16} className="mr-1" /> Zrušit
-                        </Button>
-                      </>
-                    )}
-                    {p.status === "paused" && (
-                      <Button onClick={() => resume(p)}>
-                        <Play size={16} className="mr-1" /> Obnovit
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    {running(p) ? (
+                      <Button variant="ghost" onClick={() => pause(p)}>
+                        <Pause size={16} /> Pozastavit
                       </Button>
+                    ) : (
+                      p.downloadedChapters + p.failedChapters < p.totalChapters && (
+                        <Button onClick={() => resume(p)}>
+                          <Play size={16} /> {p.downloadedChapters > 0 ? "Pokračovat" : "Spustit"}
+                        </Button>
+                      )
                     )}
-                    {p.status !== "downloading" && p.failedChapters > 0 && (
+                    {!running(p) && p.failedChapters > 0 && (
                       <Button variant="ghost" onClick={() => retry(p)}>
-                        <RefreshCw size={16} className="mr-1" /> Zkusit selhané
+                        <RefreshCw size={16} /> Opakovat selhané
                       </Button>
                     )}
-                    {p.status === "completed" && (
+                    <Button variant="ghost" onClick={() => navigate(`/project/${p.id}`)}>
+                      <FileText size={16} /> Detail
+                    </Button>
+                    {p.downloadedChapters > 0 && (
                       <Button variant="ghost" onClick={() => navigate(`/project/${p.id}/export`)}>
-                        <Share2 size={16} className="mr-1" /> Export EPUB
+                        <Share2 size={16} /> EPUB
+                      </Button>
+                    )}
+                    {!running(p) && (
+                      <Button variant="danger" onClick={() => remove(p)}>
+                        <Trash2 size={16} /> Smazat
                       </Button>
                     )}
                   </div>
@@ -150,16 +167,6 @@ export function Downloads() {
       )}
     </div>
   );
-}
-
-function statusLabel(s: string): string {
-  switch (s) {
-    case "completed": return "Dokončeno";
-    case "downloading": return "Stahuje se";
-    case "paused": return "Pozastaveno";
-    case "failed": return "Chyba";
-    default: return "Připraveno";
-  }
 }
 
 function domainOf(url: string): string {

@@ -35,7 +35,31 @@ export const storage = {
   },
 
   async writeFile(path: string, data: string): Promise<void> {
-    await Filesystem.writeFile({ path, data, directory: Directory.Documents, encoding: Encoding.UTF8 });
+    await Filesystem.writeFile({ path, data, directory: Directory.Documents, encoding: Encoding.UTF8, recursive: true });
+  },
+
+  /**
+   * Zapíše BINÁRNÍ soubor z base64. Bez `encoding` plugin base64 dekóduje a
+   * uloží skutečné bajty. (S Encoding.UTF8 by se uložil base64 TEXT – takový
+   * "EPUB" nebo "obrázek" žádná aplikace neotevře.)
+   */
+  async writeBinary(path: string, base64: string): Promise<void> {
+    await Filesystem.writeFile({ path, data: base64, directory: Directory.Documents, recursive: true });
+  },
+
+  /** Přečte soubor jako base64 (binárně). */
+  async readBinary(path: string): Promise<string> {
+    const res = await Filesystem.readFile({ path, directory: Directory.Documents });
+    if (typeof res.data === "string") return res.data.replace(/\s+/g, "");
+    return await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const r = String(reader.result ?? "");
+        resolve(r.includes(",") ? r.split(",")[1] : r);
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(res.data as Blob);
+    });
   },
 
   async readFile(path: string): Promise<string> {

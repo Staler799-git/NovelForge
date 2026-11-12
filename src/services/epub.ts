@@ -1,6 +1,10 @@
 import JSZip from "jszip";
 import { db } from "./db";
 import { storage } from "@/services/storage";
+import { escapeXml, sanitizeToXhtml } from "./content";
+import { normalizeLanguage } from "./parser/base";
+import { bytesToBase64 } from "./http";
+import { extForMime } from "./cover";
 import type { Project } from "@/types";
 
 export interface EpubChapter {
@@ -9,23 +13,38 @@ export interface EpubChapter {
   filePath?: string;
 }
 
-function esc(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]!));
+export interface EpubBuildResult {
+  data: Uint8Array;
+  /** Názvy kapitol, jejichž soubor se nepodařilo načíst (v knize chybí). */
+  missing: string[];
+  chapterCount: number;
 }
+
+const esc = escapeXml;
 
 function safeName(s: string): string {
   return s.replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "").toLowerCase() || "chapter";
 }
 
 function bodyTextFromFile(html: string): string {
-  const m = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-  if (!m) return "";
-  return m[1].replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return chapterBodyFromFile(html).replace(/<[^>]*>/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
 }
 
-function bodyHtmlFromFile(html: string): string {
-  const m = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-  return m ? m[1] : html;
+/**
+ * Vytáhne z uloženého souboru kapitoly jen samotný text (obsah .chapter-body)
+ * a vrátí ho jako well-formed XHTML.
+ *
+ * Dřív se bral celý <body> včetně hlavičky, takže název kapitoly byl v EPUB
+ * dvakrát, a HTML se nepřevádělo na XHTML (soubory ze starších verzí obsahují
+ * `<br>` a `&nbsp;`, což v EPUB není platné).
+ */
+export function chapterBodyFromFile(html: string): string {
+  // <head> se zahazuje: stačí tělo a parser nemá důvod sahat na styly.
+  const doc = new DOMParser().parseFromString(html.replace(/^<\?xml[^>]*\?>/, "").replace(/<head[\s>][\s\S]*?<\/head>/i, ""), "text/html");
+  const body = doc.querySelector(".chapter-body");
+  if (body) return sanitizeToXhtml(body.innerHTML);
+  for (const el of Array.from(doc.querySelectorAll("header.chapter-header"))) el.remove();
+  return sanitizeToXhtml(doc.body?.innerHTML ?? html);
 }
 
 const STYLES_CSS = `
@@ -41,7 +60,7 @@ p { margin: 0.7em 0; text-align: justify; }
 .chapter-meta { font-size: 0.9em; color: #555; margin-bottom: 1em; }
 ol.toc { list-style: none; padding-left: 0; }
 ol.toc li { margin: 0.5em 0; font-size: 1.05em; }
-nav[epub|type="toc"] ol { padding-left: 1.2em; }
+nav#toc ol { padding-left: 1.2em; }
 .small { font-size: 0.9em; color: #666; }
 `.trim();
 
@@ -52,20 +71,18 @@ const CONTAINER_XML = `<?xml version="1.0" encoding="UTF-8"?>
   </rootfiles>
 </container>`;
 
-function ncx(project: Project, chapters: EpubChapter[]): string {
+const chapterFile = (i: number) => `chapter-${String(i + 1).padStart(5, "0")}.xhtml`;
+
+function ncx(project: Project, lang: string, chapters: EpubChapter[]): string {
   const uid = `urn:uuid:${project.id}`;
   const navPoints = chapters
     .map(
       (c, i) =>
-        `<navPoint id="nav-${i + 1}" playOrder="${i + 1}">
-  <navLabel><text>${esc(c.title)}</text></navLabel>
-  <content src="chapter-${String(i + 1).padStart(4, "0")}.xhtml"/>
-</navPoint>`
+        `    <navPoint id="nav-${i + 1}" playOrder="${i + 1}"><navLabel><text>${esc(c.title)}</text></navLabel><content src="${chapterFile(i)}"/></navPoint>`
     )
     .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
-<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="${esc(project.language)}">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="${esc(lang)}">
   <head>
     <meta name="dtb:uid" content="${esc(uid)}"/>
     <meta name="dtb:depth" content="1"/>
@@ -73,30 +90,29 @@ function ncx(project: Project, chapters: EpubChapter[]): string {
     <meta name="dtb:maxPageNumber" content="0"/>
   </head>
   <docTitle><text>${esc(project.title)}</text></docTitle>
-  <docAuthor><text>${esc(project.author)}</text></docAuthor>
   <navMap>
 ${navPoints}
   </navMap>
 </ncx>`;
 }
 
-function navXhtml(project: Project, chapters: EpubChapter[]): string {
-  const items = chapters
-    .map(
-      (c, i) =>
-        `<li><a href="chapter-${String(i + 1).padStart(4, "0")}.xhtml">${esc(c.title)}</a></li>`
-    )
-    .join("\n");
+function tocTitle(lang: string): string {
+  return lang.startsWith("cs") ? "Obsah" : lang.startsWith("sk") ? "Obsah" : lang.startsWith("de") ? "Inhalt" : "Contents";
+}
+
+function navXhtml(project: Project, lang: string, chapters: EpubChapter[]): string {
+  const items = chapters.map((c, i) => `      <li><a href="${chapterFile(i)}">${esc(c.title)}</a></li>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="${esc(project.language)}" lang="${esc(project.language)}">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="${esc(lang)}" lang="${esc(lang)}">
 <head>
   <meta charset="UTF-8"/>
-  <title>${esc(project.title)} - Obsah</title>
+  <title>${esc(project.title)}</title>
+  <link rel="stylesheet" type="text/css" href="styles.css"/>
 </head>
 <body>
   <nav epub:type="toc" id="toc">
-    <h1>Obsah</h1>
+    <h1>${tocTitle(lang)}</h1>
     <ol>
 ${items}
     </ol>
@@ -105,49 +121,76 @@ ${items}
 </html>`;
 }
 
-function opf(project: Project, chapters: EpubChapter[], coverId: string | null, modified: string): string {
-  const uid = `urn:uuid:${project.id}`;
-  const manifestItems: string[] = [];
-  const spineItems: string[] = [];
+function coverXhtml(project: Project, lang: string, coverHref: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="${esc(lang)}" lang="${esc(lang)}">
+<head>
+  <meta charset="UTF-8"/>
+  <title>${esc(project.title)}</title>
+  <link rel="stylesheet" type="text/css" href="styles.css"/>
+</head>
+<body>
+  <section class="cover" epub:type="cover"><img src="${esc(coverHref)}" alt="${esc(project.title)}"/></section>
+</body>
+</html>`;
+}
 
-  if (coverId) {
-    manifestItems.push(`    <item id="${coverId}" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/>`);
-    spineItems.push(`    <itemref idref="${coverId}" linear="no"/>`);
+interface CoverRef {
+  href: string;
+  mime: string;
+}
+
+function opf(project: Project, lang: string, chapters: EpubChapter[], cover: CoverRef | null, modified: string): string {
+  const uid = `urn:uuid:${project.id}`;
+  const manifest: string[] = [];
+  const spine: string[] = [];
+
+  if (cover) {
+    // Obrázek obálky se v manifestu označí properties="cover-image" (EPUB 3)
+    // a navíc <meta name="cover"> (EPUB 2 čtečky). Do spine patří XHTML
+    // stránka s obrázkem – samotný obrázek ve spine být nesmí.
+    manifest.push(`    <item id="cover-image" href="${esc(cover.href)}" media-type="${esc(cover.mime)}" properties="cover-image"/>`);
+    manifest.push(`    <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>`);
+    spine.push(`    <itemref idref="cover"/>`);
   }
-  manifestItems.push(`    <item id="css" href="styles.css" media-type="text/css"/>`);
-  manifestItems.push(`    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>`);
-  manifestItems.push(`    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>`);
+  manifest.push(`    <item id="css" href="styles.css" media-type="text/css"/>`);
+  manifest.push(`    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>`);
+  manifest.push(`    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>`);
   chapters.forEach((_c, i) => {
-    const id = `chap-${i + 1}`;
-    const file = `chapter-${String(i + 1).padStart(4, "0")}.xhtml`;
-    manifestItems.push(`    <item id="${id}" href="${file}" media-type="application/xhtml+xml"/>`);
-    spineItems.push(`    <itemref idref="${id}"/>`);
+    manifest.push(`    <item id="chap-${i + 1}" href="${chapterFile(i)}" media-type="application/xhtml+xml"/>`);
+    spine.push(`    <itemref idref="chap-${i + 1}"/>`);
   });
 
+  const meta: string[] = [
+    `    <dc:identifier id="bookid">${esc(uid)}</dc:identifier>`,
+    `    <dc:title>${esc(project.title)}</dc:title>`,
+    `    <dc:language>${esc(lang)}</dc:language>`,
+  ];
+  if (project.author) {
+    meta.push(`    <dc:creator id="creator">${esc(project.author)}</dc:creator>`);
+    meta.push(`    <meta refines="#creator" property="role" scheme="marc:relators">aut</meta>`);
+  }
+  if (project.description) meta.push(`    <dc:description>${esc(project.description)}</dc:description>`);
+  if (project.sourceUrl) meta.push(`    <dc:source>${esc(project.sourceUrl)}</dc:source>`);
+  meta.push(`    <meta property="dcterms:modified">${esc(modified)}</meta>`);
+  if (cover) meta.push(`    <meta name="cover" content="cover-image"/>`);
+
   return `<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" xml:lang="${esc(project.language)}" unique-identifier="bookid" prefix="dcterms: http://purl.org/dc/terms/ schema: http://schema.org/">
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" xml:lang="${esc(lang)}" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="bookid">${esc(uid)}</dc:identifier>
-    <dc:title>${esc(project.title)}</dc:title>
-${project.author ? `    <dc:creator opf:role="aut" opf:file-as="${esc(project.author)}">${esc(project.author)}</dc:creator>` : ""}
-    <dc:language>${esc(project.language)}</dc:language>
-${project.description ? `    <dc:description>${esc(project.description)}</dc:description>` : ""}
-    <meta property="dcterms:modified">${esc(modified)}</meta>
-${coverId ? `    <meta name="cover" content="${coverId}"/>` : ""}
-    <meta property="schema:accessMode">text</meta>
-    <meta property="schema:accessModeSufficient">text</meta>
-    <meta name="generator" content="NovelForge 1.0"/>
+${meta.join("\n")}
   </metadata>
   <manifest>
-${manifestItems.join("\n")}
+${manifest.join("\n")}
   </manifest>
-  <spine>
-${spineItems.join("\n")}
+  <spine toc="ncx">
+${spine.join("\n")}
   </spine>
 </package>`;
 }
 
-function chapterXhtml(title: string, bodyHtml: string, lang: string): string {
+function chapterXhtml(title: string, bodyXhtml: string, lang: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="${esc(lang)}" lang="${esc(lang)}">
@@ -157,18 +200,77 @@ function chapterXhtml(title: string, bodyHtml: string, lang: string): string {
   <link rel="stylesheet" type="text/css" href="styles.css"/>
 </head>
 <body>
-  <div class="chapter">
+  <section class="chapter">
     <h1>${esc(title)}</h1>
-    <div class="chapter-body">${bodyHtml}</div>
-  </div>
+${bodyXhtml}
+  </section>
 </body>
 </html>`;
 }
 
-function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
+/**
+ * Sestaví JEDEN EPUB 3 se všemi předanými kapitolami v pořadí `orderIndex`.
+ *
+ * - jazyk se bere z metadat projektu (dřív byl v XHTML natvrdo "cs"),
+ * - obálka se vloží se správným MIME typem a příponou,
+ * - obsah, navigace (nav.xhtml) i toc.ncx používají STEJNÉ seřazené pořadí,
+ * - každý soubor je well-formed XML.
+ */
+export async function buildEpubDetailed(
+  project: Project,
+  chapters: EpubChapter[],
+  coverBase64?: string,
+  coverMime = "image/jpeg",
+  onProgress?: (done: number, total: number) => void,
+): Promise<EpubBuildResult> {
+  const zip = new JSZip();
+  const lang = normalizeLanguage(project.language, "en");
+
+  // mimetype musí být první položka archivu a nekomprimovaná
+  zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
+  zip.file("META-INF/container.xml", CONTAINER_XML);
+
+  let cover: CoverRef | null = null;
+  if (coverBase64) {
+    cover = { href: `cover.${extForMime(coverMime)}`, mime: coverMime };
+    zip.file(`OEBPS/${cover.href}`, coverBase64.replace(/\s+/g, ""), { base64: true });
+    zip.file("OEBPS/cover.xhtml", coverXhtml(project, lang, cover.href));
+  }
+  zip.file("OEBPS/styles.css", STYLES_CSS);
+
+  const ordered = chapters.slice().sort((a, b) => a.orderIndex - b.orderIndex);
+  const included: EpubChapter[] = [];
+  const missing: string[] = [];
+  for (let i = 0; i < ordered.length; i++) {
+    const c = ordered[i];
+    let body = "";
+    if (c.filePath) {
+      try {
+        body = chapterBodyFromFile(await storage.readFile(c.filePath));
+      } catch {
+        body = "";
+      }
+    }
+    if (!body.trim()) {
+      missing.push(c.title);
+    } else {
+      zip.file(`OEBPS/${chapterFile(included.length)}`, chapterXhtml(c.title, body, lang));
+      included.push(c);
+    }
+    if (onProgress && (i % 25 === 0 || i === ordered.length - 1)) onProgress(i + 1, ordered.length);
+  }
+  if (included.length === 0) {
+    throw new Error("Žádná z vybraných kapitol nemá uložený text – EPUB nelze vytvořit.");
+  }
+
+  zip.file("OEBPS/toc.ncx", ncx(project, lang, included));
+  zip.file("OEBPS/nav.xhtml", navXhtml(project, lang, included));
+  // dcterms:modified musí být přesně CCYY-MM-DDThh:mm:ssZ (bez milisekund)
+  const modified = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  zip.file("OEBPS/content.opf", opf(project, lang, included, cover, modified));
+
+  const data = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", mimeType: "application/epub+zip" });
+  return { data, missing, chapterCount: included.length };
 }
 
 export async function buildEpub(
@@ -177,53 +279,26 @@ export async function buildEpub(
   coverBase64?: string,
   coverMime = "image/jpeg"
 ): Promise<Uint8Array> {
-  const zip = new JSZip();
-
-  zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
-  zip.file("META-INF/container.xml", CONTAINER_XML);
-
-  const coverId = coverBase64 ? "cover-image" : null;
-  if (coverBase64) {
-    zip.file(`OEBPS/cover.${coverMime === "image/png" ? "png" : coverMime === "image/svg+xml" ? "svg" : "jpg"}`, coverBase64, { base64: true });
-  }
-  zip.file("OEBPS/styles.css", STYLES_CSS);
-  zip.file("OEBPS/toc.ncx", ncx(project, chapters));
-  zip.file("OEBPS/nav.xhtml", navXhtml(project, chapters));
-
-  const ordered = chapters.slice().sort((a, b) => a.orderIndex - b.orderIndex);
-  for (let i = 0; i < ordered.length; i++) {
-    const c = ordered[i];
-    const file = `chapter-${String(i + 1).padStart(4, "0")}.xhtml`;
-    let bodyHtml = "";
-    if (c.filePath) {
-      try {
-        bodyHtml = bodyHtmlFromFile(await storage.readFile(c.filePath));
-      } catch {
-        bodyHtml = "";
-      }
-    }
-    zip.file(`OEBPS/${file}`, chapterXhtml(c.title, bodyHtml, project.language));
-  }
-
-  zip.file("OEBPS/content.opf", opf(project, ordered, coverId, new Date().toISOString()));
-
-  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+  return (await buildEpubDetailed(project, chapters, coverBase64, coverMime)).data;
 }
 
 export async function generateEpub(
   project: Project,
   chapters: EpubChapter[],
   coverBase64?: string,
-  coverMime = "image/jpeg"
-): Promise<{ path: string; size: number }> {
+  coverMime = "image/jpeg",
+  onProgress?: (done: number, total: number) => void,
+): Promise<{ path: string; size: number; missing: string[]; chapterCount: number }> {
   await storage.init();
-  const content = await buildEpub(project, chapters, coverBase64, coverMime);
-  const fileName = `novel-${safeName(project.title)}-${project.id.slice(0, 8)}.epub`;
+  const built = await buildEpubDetailed(project, chapters, coverBase64, coverMime, onProgress);
+  const fileName = `${safeName(project.title)}-${project.id.slice(0, 8)}.epub`;
   const path = storage.epubPath(fileName);
-  await storage.writeFile(path, uint8ArrayToBase64(content));
+  // BINÁRNÍ zápis. Dřív se base64 zapisoval s Encoding.UTF8, takže soubor
+  // .epub obsahoval base64 text a žádná čtečka ho neotevřela.
+  await storage.writeBinary(path, bytesToBase64(built.data));
   const size = await storage.fileSize(path);
   await db.updateProject(project.id, { epubPath: path });
-  return { path, size: size ?? content.byteLength };
+  return { path, size: size ?? built.data.byteLength, missing: built.missing, chapterCount: built.chapterCount };
 }
 
 export async function generateTxt(project: Project, chapters: EpubChapter[]): Promise<{ path: string; size: number }> {
@@ -244,7 +319,7 @@ export async function generateTxt(project: Project, chapters: EpubChapter[]): Pr
     text += `${c.title}\n${"-".repeat(c.title.length)}\n\n${body}\n\n`;
     text += "~".repeat(40) + "\n\n";
   }
-  const fileName = `novel-${safeName(project.title)}-${project.id.slice(0, 8)}.txt`;
+  const fileName = `${safeName(project.title)}-${project.id.slice(0, 8)}.txt`;
   const path = storage.epubPath(fileName);
   await storage.writeFile(path, text);
   const size = await storage.fileSize(path);
@@ -259,7 +334,7 @@ export async function generateHtml(project: Project, chapters: EpubChapter[]): P
     let bodyHtml = "";
     if (c.filePath) {
       try {
-        bodyHtml = bodyHtmlFromFile(await storage.readFile(c.filePath));
+        bodyHtml = chapterBodyFromFile(await storage.readFile(c.filePath));
       } catch {
         bodyHtml = "";
       }
@@ -275,7 +350,7 @@ export async function generateHtml(project: Project, chapters: EpubChapter[]): P
 ${parts.join("\n")}
 </body>
 </html>`;
-  const fileName = `novel-${safeName(project.title)}-${project.id.slice(0, 8)}.html`;
+  const fileName = `${safeName(project.title)}-${project.id.slice(0, 8)}.html`;
   const path = storage.epubPath(fileName);
   await storage.writeFile(path, html);
   const size = await storage.fileSize(path);

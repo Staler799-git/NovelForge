@@ -46,9 +46,9 @@ workflows:
         XCODE_SCHEME: App
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_PROJECT: ios/App/App.xcodeproj
-        # 1.1.1 = safe-area (viewport-fit=cover), testy CSS nezávislé na dist/.
+        # 1.1.2 = celý stránkovaný katalog, spolehlivé stahování, obálky, platný EPUB.
         # Číslo buildu (CFBundleVersion) = Codemagic BUILD_NUMBER, roste s každým během.
-        APP_VERSION: 1.1.1
+        APP_VERSION: 1.1.2
 
     cache:
       cache_paths:
@@ -200,8 +200,8 @@ workflows:
             -destination "generic/platform=iOS" \
             -derivedDataPath build/derived \
             -allowProvisioningUpdates=NO \
-            MARKETING_VERSION="${APP_VERSION:-1.1.1}" \
-            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-3}" \
+            MARKETING_VERSION="${APP_VERSION:-1.1.2}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-4}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \

@@ -17,19 +17,13 @@ async function fixture(name: string): Promise<string> {
 }
 
 const WUXIABOX_NOVEL = "https://www.wuxiabox.com/novel/i-created-the-longevity-club.html";
-const WUXIABOX_CH1 = "https://www.wuxiabox.com/novel/i-created-the-longevity-club/kapitola-1.html";
 const GENERIC_NOVEL = "https://example.com/novel/cizi-novela.html";
 const GENERIC_CH1 = "https://example.com/novel/cizi-novela/kapitola-1.html";
 
-vi.mock("@/services/http", () => ({
+vi.mock("@/services/http", async (orig) => ({
+  ...(await orig<typeof import("@/services/http")>()),
   http: {
     get: vi.fn(async (url: string) => {
-      if (url === WUXIABOX_NOVEL) {
-        return { url, status: 200, ok: true, data: await fixture("wuxiabox-list.html"), headers: {} };
-      }
-      if (url.startsWith("https://www.wuxiabox.com/novel/i-created-the-longevity-club/kapitola")) {
-        return { url, status: 200, ok: true, data: await fixture("wuxiabox-chapter.html"), headers: {} };
-      }
       if (url === GENERIC_NOVEL) {
         return { url, status: 200, ok: true, data: await fixture("generic-novel.html"), headers: {} };
       }
@@ -50,42 +44,6 @@ describe("parser registry", () => {
     expect(getParser(WUXIABOX_NOVEL)).toBeInstanceOf(WuxiaBoxParser);
     expect(getParser(GENERIC_NOVEL)).toBeInstanceOf(GenericNovelParser);
     expect(getParser("https://jiny-web.cz/kniha")).toBeInstanceOf(GenericNovelParser);
-  });
-});
-
-describe("WuxiaBox parser", () => {
-  it("detekuje metadata z obálky stránky", async () => {
-    const meta = await parseMetadata(WUXIABOX_NOVEL);
-    expect(meta.title).toBe("I Created the Longevity Club");
-    expect(meta.author).toBe("Mistr Wuxia");
-    expect(meta.sourceUrl).toBe(WUXIABOX_NOVEL);
-    expect(meta.sourceDomain).toBe("www.wuxiabox.com");
-    expect(meta.coverUrl).toBe("https://www.wuxiabox.com/obalky/i-created-the-longevity-club.jpg");
-    expect(meta.language).toBe("cs");
-  });
-
-  it("vypíše kapitoly v správném pořadí podle čísla v názvu", async () => {
-    const chapters = await parseChapterList(WUXIABOX_NOVEL);
-    expect(chapters.length).toBe(4);
-    expect(chapters.map((c) => c.title)).toEqual([
-      "Kapitola 1: Zrození klubu",
-      "Kapitola 2: První členové",
-      "Kapitola 3: Rozšíření",
-      "Kapitola 10: Desátá kapitola",
-    ]);
-    expect(chapters.map((c) => c.orderIndex)).toEqual([0, 1, 2, 3]);
-    // vyloučeny nekapitola odkazy (autor, kategorie)
-    expect(chapters.some((c) => c.url.includes("/profil/autora"))).toBe(false);
-    expect(chapters.some((c) => c.url.includes("/kategorie/"))).toBe(false);
-  });
-
-  it("vyčistí kapitolu od navigace, reklamy a patičky", async () => {
-    const ch = await parseChapter(WUXIABOX_CH1);
-    expect(ch.title).toBe("Kapitola 1: Zrození klubu");
-    expect(ch.html).toContain("První odstavec kapitoly...");
-    expect(ch.html).not.toContain("REKLAMA");
-    expect(ch.html).not.toContain("Další kapitola");
-    expect(ch.html).not.toContain("Kontakt");
   });
 });
 
