@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { Preferences } from "@capacitor/preferences";
 import { Card, SectionTitle, Button, Input, Badge } from "@/components/ui";
 import { ShieldCheck, Info } from "lucide-react";
+import { diag, type PreviousSession } from "@/services/diag";
+import { storage } from "@/services/storage";
 
 const KEY_CONCURRENT = "app_default_concurrent";
 const KEY_DELAY = "app_default_delay";
@@ -12,6 +14,34 @@ export function Settings() {
   const [delay, setDelay] = useState(1500);
   const [retries, setRetries] = useState(5);
   const [saving, setSaving] = useState(false);
+  const [prev, setPrev] = useState<PreviousSession | null>(() => diag.previousSession());
+  const [diagMsg, setDiagMsg] = useState("");
+  const [diagBusy, setDiagBusy] = useState(false);
+
+  const exportDiagnostics = async () => {
+    setDiagBusy(true);
+    setDiagMsg("");
+    try {
+      const path = await diag.exportFile();
+      await storage.shareFile(path, "NovelForge – diagnostika");
+    } catch (err) {
+      const text = String((err as Error)?.message ?? err);
+      if (!/cancel/i.test(text)) setDiagMsg(`Export se nepodařil: ${text}`);
+    } finally {
+      setDiagBusy(false);
+    }
+  };
+
+  const clearDiagnostics = async () => {
+    setDiagBusy(true);
+    try {
+      await diag.clear();
+      setPrev(null);
+      setDiagMsg("Diagnostický záznam byl smazán.");
+    } finally {
+      setDiagBusy(false);
+    }
+  };
 
   useEffect(() => {
     const load = async () => {
@@ -84,6 +114,29 @@ export function Settings() {
           <Button onClick={saveDefaults} disabled={saving}>
             {saving ? "Ukládá se…" : "Uložit výchozí hodnoty"}
           </Button>
+        </div>
+      </Card>
+
+      <Card>
+        <SectionTitle>Diagnostika</SectionTitle>
+        <div className="space-y-3">
+          <div className="text-xs text-white/50 leading-relaxed">
+            Aplikace si průběžně zapisuje technický záznam stahování (čas, adresa a číslo kapitoly, použitý parser, stav odpovědi, chyby).
+            Záznam neobsahuje cookies, přihlašovací údaje, tokeny ani text kapitol a zůstává jen ve vašem zařízení, dokud ho sami neodešlete.
+          </div>
+          {prev?.interrupted && (
+            <div className="p-3 rounded-xl bg-white/5 border border-white/10 text-xs text-white/70 leading-relaxed" data-testid="diag-interrupted">
+              Minulé spuštění skončilo nečekaně během stahování.
+              {prev.openOperations.length > 0 && (
+                <span className="block mt-1 break-all text-white/50">Nedokončená operace: {prev.openOperations[prev.openOperations.length - 1]}</span>
+              )}
+            </div>
+          )}
+          <div className="flex gap-2">
+            <Button onClick={exportDiagnostics} disabled={diagBusy}>Exportovat diagnostiku</Button>
+            <Button variant="ghost" onClick={clearDiagnostics} disabled={diagBusy}>Smazat záznam</Button>
+          </div>
+          {diagMsg && <div className="text-xs text-white/60">{diagMsg}</div>}
         </div>
       </Card>
 

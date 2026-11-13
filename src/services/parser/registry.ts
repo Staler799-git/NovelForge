@@ -18,6 +18,12 @@ export function getParser(url: string): NovelParser {
 
 const genericParser = new GenericNovelParser();
 
+/** Údaje o parseru pro danou adresu (diagnostika, omezení souběžnosti). */
+export function parserInfo(url: string): { name: string; maxConcurrency: number } {
+  const p = getParser(url);
+  return { name: p.name, maxConcurrency: p.maxConcurrency };
+}
+
 export async function parseMetadata(url: string, opts?: FetchOptions): Promise<NovelMetadata> {
   return getParser(url).fetchMetadata(url, opts);
 }

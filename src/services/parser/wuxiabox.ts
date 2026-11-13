@@ -40,6 +40,7 @@ interface Entry extends ParserChapter {
 }
 
 export class WuxiaBoxParser extends NovelParser {
+  override readonly name: string = "wuxiabox";
   /** Prodleva mezi stránkami katalogu (testy ji nastavují na 0). */
   pageDelayMs = PAGE_DELAY_MS;
 
