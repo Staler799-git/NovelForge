@@ -6,7 +6,7 @@ import { projectStore } from "@/store";
 import type { Project } from "@/types";
 import { Card, SectionTitle, Button, Badge, ProgressBar, Cover } from "@/components/ui";
 import { formatDateShort } from "@/lib/utils";
-import { projectStatusLabel } from "./ProjectDetail";
+import { projectStatus } from "@/services/status";
 import { Download, Pause, Play, RefreshCw, Trash2, Share2, FileText, Clock } from "lucide-react";
 
 export function Downloads() {
@@ -115,8 +115,8 @@ export function Downloads() {
                   <ProgressBar value={p.totalChapters ? Math.floor((p.downloadedChapters / p.totalChapters) * 100) : 0} className="h-2.5" />
 
                   <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <Badge variant={running(p) ? "warn" : p.status === "completed" ? "ok" : p.status === "failed" ? "bad" : "muted"}>
-                      {projectStatusLabel(p, running(p))}
+                    <Badge variant={projectStatus(p, running(p)).variant}>
+                      {projectStatus(p, running(p)).label}
                     </Badge>
                     {p.failedChapters > 0 && <Badge variant="bad">{p.failedChapters} selhalo</Badge>}
                     <span className="text-white/40">{formatDateShort(p.updatedAt)}</span>

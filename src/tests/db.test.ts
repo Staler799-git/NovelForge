@@ -108,11 +108,12 @@ describe("databáze", () => {
     const runs = of("run");
     expect(runs).toHaveLength(Math.ceil(3138 / 80));
     const values = runs.flatMap((r) => r.arg.values as unknown[]);
-    expect(values).toHaveLength(3138 * 5);
+    expect(values).toHaveLength(3138 * 6);
     const ids = new Set<string>();
     for (let i = 0; i < 3138; i++) {
-      ids.add(values[i * 5] as string);
-      expect(values[i * 5 + 4]).toBe(i);
+      ids.add(values[i * 6] as string);
+      expect(values[i * 6 + 4]).toBe(i);
+      expect(values[i * 6 + 5]).toBe(0);
     }
     expect(ids.size).toBe(3138);
     // stav už stažených kapitol se opakovaným vložením nemění

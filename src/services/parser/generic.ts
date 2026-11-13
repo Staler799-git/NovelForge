@@ -1,5 +1,6 @@
 import { NovelParser, ContentError, cleanText, extractTitle, findCoverUrl, detectLanguage } from "./base";
-import type { NovelMetadata, ParserChapter, FetchOptions } from "@/types";
+import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
+import { cleanChapterElement, stripBoilerplateXhtml } from "@/services/clean";
 import { sanitizeToXhtml, assertChapterContent } from "@/services/content";
 
 const CHAPTER_KEYWORDS = [
@@ -12,15 +13,107 @@ const EXCLUDE_HREF = [
   "epub", "pdf", "mobi", "ajax", "wp-admin", "feed", "rss",
   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".css", ".js", ".ico", ".svg", ".woff",
 ];
-const EXCLUDE_TEXT = ["domů", "home", "hlavní", "vyhledávání", "search", "menu", "navigace"];
 
-function looksLikeChapterLink(text: string, href: string): boolean {
-  const t = cleanText(text).toLowerCase();
+const EXCLUDE_TEXT_RE = /^(domů|home|hlavní|vyhledávání|search|menu|navigace|log ?in|sign ?(in|up)|register|přihlásit|registrace|terms|privacy|dmca|contact|about|discord|changelog|updates?|news|ranking|genres?|next|prev(ious)?|more|read more)$/i;
+/** Verze aplikace/webu ("v1.13.17", "2.4.0"), datum, čas – nikdy název kapitoly. */
+const TECHNICAL_TEXT_RE = /^(v(er(sion)?)?\.?\s*)?\d+(\.\d+){1,3}([-+][\w.]+)?$|^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}$|^\d{1,2}:\d{2}$/i;
+const NAV_ANCESTORS = "nav, header, footer, aside, form, [role=navigation], [role=contentinfo], [role=banner]";
+const NAV_TOKENS = new Set(["menu", "nav", "navbar", "navigation", "footer", "header", "breadcrumb", "breadcrumbs", "pagination", "pager", "social", "login", "sidebar", "widget", "recommend", "recommended", "related", "ranking", "popular", "ads", "ad", "banner", "version"]);
+
+function inNavigation(a: Element): boolean {
+  if (a.closest(NAV_ANCESTORS)) return true;
+  let el: Element | null = a;
+  for (let depth = 0; el && depth < 6; depth++, el = el.parentElement) {
+    const raw = `${el.getAttribute("class") ?? ""} ${el.getAttribute("id") ?? ""}`.toLowerCase();
+    if (raw.trim() && raw.split(/[^a-z0-9]+/).some((t) => NAV_TOKENS.has(t))) return true;
+  }
+  return false;
+}
+
+interface Candidate {
+  title: string;
+  url: string;
+  /** Odkaz výslovně jmenuje kapitolu ("Chapter 12", "Kapitola 3"). */
+  keyword: boolean;
+  /** Tvar adresy s čísly nahrazenými znakem #. */
+  shape: string;
+}
+
+function chapterCandidate(text: string, href: string): Candidate | null {
+  const t = cleanText(text);
+  const low = t.toLowerCase();
   const h = href.toLowerCase();
-  if (EXCLUDE_TEXT.includes(t) || t.length < 2) return false;
-  if (EXCLUDE_HREF.some((k) => h.includes(k))) return false;
-  const kw = CHAPTER_KEYWORDS.some((k) => t.includes(k.toLowerCase()) || h.includes(k.toLowerCase()));
-  return kw || /\d/.test(t);
+  if (t.length < 1 || t.length > 200) return null;
+  if (EXCLUDE_TEXT_RE.test(t) || TECHNICAL_TEXT_RE.test(t)) return null;
+  if (EXCLUDE_HREF.some((k) => h.includes(k))) return null;
+  let path = h;
+  try {
+    path = new URL(href).pathname.toLowerCase();
+  } catch {
+    /* ponechat */
+  }
+  const kwText = CHAPTER_KEYWORDS.some((k) => k.length >= 3 && low.includes(k.toLowerCase())) && /\d/.test(low) || /^(prolog|epilog|epilóg|prologue|epilogue)\b/i.test(low);
+  const kwPath = /(chapter|chap|kapitola|episode|dil|cast|part)[-_/]?\d+/.test(path);
+  const numeric = /^\d{1,5}$/.test(t) || /\d/.test(path.split("/").pop() ?? "");
+  if (!kwText && !kwPath && !numeric) return null;
+  return { title: t, url: href, keyword: kwText || kwPath, shape: path.replace(/\d+/g, "#") };
+}
+
+export const UNRELIABLE_CATALOG = "Katalog kapitol nebyl spolehlivě rozpoznán.";
+
+/**
+ * Vybere ze stránky odkazy na kapitoly a ohodnotí důvěryhodnost detekce.
+ *
+ * Kapitoly tvoří SKUPINU odkazů se stejným tvarem adresy. Jediný odkaz
+ * obsahující číslo (verze webu v patičce, datum aktualizace…) katalogem není –
+ * v takovém případě se vyhodí chyba, místo aby vznikl falešný projekt.
+ */
+export function detectChapterLinks(doc: Document, baseUrl: string): ParserChapter[] {
+  const seen = new Set<string>();
+  const candidates: Candidate[] = [];
+  let baseHost = "";
+  try {
+    baseHost = new URL(baseUrl).hostname.replace(/^www\./, "");
+  } catch {
+    /* neplatná adresa */
+  }
+  for (const a of Array.from(doc.querySelectorAll("a[href]"))) {
+    const href = a.getAttribute("href") ?? "";
+    if (!href || href.startsWith("#") || /^(javascript|mailto|tel):/i.test(href)) continue;
+    let abs: string;
+    try {
+      const u = new URL(href, baseUrl);
+      u.hash = "";
+      abs = u.href;
+      if (u.hostname.replace(/^www\./, "") !== baseHost) continue;
+    } catch {
+      continue;
+    }
+    if (abs === baseUrl || seen.has(abs)) continue;
+    if (inNavigation(a)) continue;
+    const c = chapterCandidate(a.textContent ?? "", abs);
+    if (!c) continue;
+    seen.add(abs);
+    candidates.push(c);
+  }
+
+  const groups = new Map<string, Candidate[]>();
+  for (const c of candidates) groups.set(c.shape, [...(groups.get(c.shape) ?? []), c]);
+  let best: Candidate[] = [];
+  let bestScore = 0;
+  for (const g of groups.values()) {
+    const kw = g.filter((c) => c.keyword).length;
+    const score = g.length + kw; // skupina výslovně pojmenovaných kapitol má přednost
+    if (score > bestScore) {
+      best = g;
+      bestScore = score;
+    }
+  }
+  const keywords = best.filter((c) => c.keyword).length;
+  const confident = best.length >= 3 || (best.length === 2 && keywords === 2);
+  if (!confident) throw new ContentError(UNRELIABLE_CATALOG, false);
+
+  return best.map((c, i) => ({ title: c.title, url: c.url, orderIndex: i }));
 }
 
 export class GenericNovelParser extends NovelParser {
@@ -32,12 +125,15 @@ export class GenericNovelParser extends NovelParser {
     const html = await this.fetchHtml(url, opts);
     const doc = this.parseHtml(html);
     const title = cleanText(this.og(doc, "title") || extractTitle(doc) || "Neznámá novela");
+    // Název shodný s názvem webu znamená, že stránka není stránkou novely.
+    const siteName = cleanText(this.og(doc, "site_name") ?? "");
+    const titleIsSite = !!siteName && title.toLowerCase() === siteName.toLowerCase();
     const author = cleanText(this.meta(doc, "author") ?? this.findAuthor(doc) ?? "");
     const description = this.og(doc, "description") || this.meta(doc, "description") || undefined;
     const coverUrl = findCoverUrl(doc, url);
     const language = detectLanguage(doc, `${title} ${description ?? ""}`);
     return {
-      title,
+      title: titleIsSite ? "" : title,
       author,
       description,
       language,
@@ -64,50 +160,37 @@ export class GenericNovelParser extends NovelParser {
   }
 
   async fetchChapterList(url: string, opts?: FetchOptions): Promise<ParserChapter[]> {
+    return (await this.readList(url, opts)).chapters;
+  }
+
+  /**
+   * Obecný parser čte seznam kapitol z jediné stránky. Když stránka seznam
+   * stránkuje, katalog se NEOZNAČÍ jako kompletní.
+   */
+  async fetchCatalog(url: string, opts?: FetchOptions): Promise<CatalogResult> {
+    const { chapters, paginated } = await this.readList(url, opts);
+    opts?.onProgress?.({ pagesLoaded: 1, pagesTotal: 1, chaptersFound: chapters.length });
+    const warnings = paginated
+      ? ["Seznam kapitol je na webu rozdělen na více stránek. Obecný parser načetl jen první z nich – katalog není kompletní."]
+      : ["Tento web nemá vlastní parser: seznam kapitol byl načten z jedné stránky a jeho úplnost nelze ověřit. Zkontrolujte počet kapitol."];
+    return { chapters, pagesLoaded: 1, complete: !paginated, aborted: false, warnings };
+  }
+
+  private async readList(url: string, opts?: FetchOptions): Promise<{ chapters: ParserChapter[]; paginated: boolean }> {
     const html = await this.fetchHtml(url, opts);
     const doc = this.parseHtml(html);
-    const links = Array.from(doc.querySelectorAll("a[href]"));
-    const seen = new Set<string>();
-    const chapters: ParserChapter[] = [];
+    const chapters = detectChapterLinks(doc, url);
+    const paginated =
+      !!doc.querySelector("a[rel=next], link[rel=next], .pagination a[href], .pager a[href], .page-numbers[href]") ||
+      Array.from(doc.querySelectorAll("a[href]")).some((a) => /[?&](page|p)=\d+|\/page\/\d+/i.test(a.getAttribute("href") ?? ""));
 
-    for (const a of links) {
-      const href = a.getAttribute("href");
-      if (!href) continue;
-      const abs = this.absoluteUrl(url, href);
-      if (!this.sameDomain(url, abs)) continue;
-      if (seen.has(abs)) continue;
-      if (!looksLikeChapterLink(a.textContent ?? "", abs)) continue;
-      seen.add(abs);
-      chapters.push({
-        title: cleanText(a.textContent ?? "") || `Kapitola ${chapters.length + 1}`,
-        url: abs,
-        orderIndex: chapters.length,
-      });
+    // Řazení podle čísel jen když je mají všechny položky; jinak pořadí na stránce.
+    const nums = chapters.map((c) => chapterNumber(c.title));
+    if (nums.every((n) => n !== null)) {
+      chapters.sort((a, b) => chapterNumber(a.title)! - chapterNumber(b.title)!);
     }
-
-    if (chapters.length === 0) {
-      for (const a of links) {
-        const href = a.getAttribute("href");
-        if (!href) continue;
-        const abs = this.absoluteUrl(url, href);
-        if (!this.sameDomain(url, abs) || seen.has(abs)) continue;
-        seen.add(abs);
-        chapters.push({
-          title: cleanText(a.textContent ?? "") || `Odkaz ${chapters.length + 1}`,
-          url: abs,
-          orderIndex: chapters.length,
-        });
-      }
-    }
-
-    chapters.sort((a, b) => {
-      const na = chapterNumber(a.title);
-      const nb = chapterNumber(b.title);
-      if (na !== null && nb !== null) return na - nb;
-      return 0;
-    });
     chapters.forEach((c, i) => (c.orderIndex = i));
-    return chapters;
+    return { chapters, paginated };
   }
 
   async fetchChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string }> {
@@ -156,7 +239,8 @@ export class GenericNovelParser extends NovelParser {
     for (const el of clone.querySelectorAll("p, div")) {
       if (!el.textContent?.trim() && !el.querySelector("img, br")) el.remove();
     }
-    return sanitizeToXhtml(clone.innerHTML);
+    cleanChapterElement(clone);
+    return stripBoilerplateXhtml(sanitizeToXhtml(clone.innerHTML)).html;
   }
 }
 

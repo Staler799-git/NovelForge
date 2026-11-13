@@ -1,6 +1,7 @@
 import { NovelParser, ContentError, cleanText, extractTitle, findCoverUrl, normalizeLanguage } from "./base";
 import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
 import { isAbort } from "@/services/http";
+import { cleanChapterElement, stripBoilerplateXhtml } from "@/services/clean";
 import { sanitizeToXhtml, assertChapterContent } from "@/services/content";
 
 /**
@@ -369,20 +370,10 @@ export class WuxiaBoxParser extends NovelParser {
       cleanText(doc.querySelector("h2, h1")?.textContent ?? "") ||
       extractTitle(doc);
 
-    // Kontejner s nejdelším textem z typických kandidátů.
-    let best: Element | null = null;
-    let bestLen = 0;
-    for (const el of Array.from(
-      doc.querySelectorAll(
-        ".chapter-content, #chapter-content, #chapter-article .chapter-content, #chapter-container, .reading-content, .entry-content, #content, .txt, article",
-      ),
-    )) {
-      const len = (el.textContent ?? "").trim().length;
-      if (len > bestLen) {
-        best = el;
-        bestLen = len;
-      }
-    }
+    // Nejužší kontejner, který nese text kapitoly. Dřív se bral kandidát s
+    // NEJDELŠÍM textem – tedy nejširší obal (article / #content) i s blokem
+    // "You'll Also Like", nápovědou čtečky a navigací, které pak skončily v EPUB.
+    const best = pickContentContainer(doc);
     if (!best) {
       throw new ContentError("Na stránce nebyl nalezen text kapitoly (web možná změnil strukturu nebo vrátil chybovou stránku)");
     }
@@ -393,15 +384,50 @@ export class WuxiaBoxParser extends NovelParser {
 
   private cleanContent(content: Element): string {
     const clone = content.cloneNode(true) as Element;
-    for (const sel of [
-      "script", "style", "noscript", "iframe", "nav", "header", "footer", "aside", "ins",
-      ".ad", ".ads", ".adsbygoogle", ".advertisement", "[class*='ad-']", "[id*='ad-']", "[class*='ads-']",
-      ".social-share", ".share-buttons", ".related-posts", ".comments",
-      ".comment-form", "form", "button", ".chapter-nav", ".chapternav", ".pagination",
-      ".next-chapter", ".prev-chapter", ".titles", ".chapter-title", ".report", ".tips",
-    ]) {
+    for (const sel of [".titles", ".chapter-title", ".chapternav", ".chapter-nav", ".next-chapter", ".prev-chapter"]) {
       for (const el of Array.from(clone.querySelectorAll(sel))) el.remove();
     }
-    return sanitizeToXhtml(clone.innerHTML);
+    cleanChapterElement(clone, { siteNames: SITE_NAMES });
+    return stripBoilerplateXhtml(sanitizeToXhtml(clone.innerHTML), { siteNames: SITE_NAMES }).html;
   }
+}
+
+const SITE_NAMES = ["wuxiabox.com", "wuxiabox"];
+
+/** Kontejnery od nejkonkrétnějšího po nejobecnější. */
+const CONTENT_SELECTORS = [
+  ".chapter-content",
+  "#chapter-content",
+  "#chapter-article .chapter-content",
+  ".reading-content",
+  ".chapter-text",
+  ".txt",
+  "#chapter-container",
+  ".entry-content",
+  "#content",
+  "article",
+];
+
+/**
+ * Vybere první (nejkonkrétnější) kontejner se skutečným textem. Když jich
+ * selektoru odpovídá víc, vezme ten s nejdelším textem v rámci TÉHOŽ selektoru.
+ */
+export function pickContentContainer(doc: Document): Element | null {
+  let fallback: Element | null = null;
+  for (const sel of CONTENT_SELECTORS) {
+    let best: Element | null = null;
+    let bestLen = 0;
+    for (const el of Array.from(doc.querySelectorAll(sel))) {
+      const len = (el.textContent ?? "").replace(/\s+/g, " ").trim().length;
+      if (len > bestLen) {
+        best = el;
+        bestLen = len;
+      }
+    }
+    if (best && bestLen >= 120) return best;
+    // Konkrétní kontejner existuje, ale je skoro prázdný: vrátí se i tak, aby
+    // následná kontrola ohlásila "podezřele krátký text", ne "nenalezeno".
+    if (best && !fallback && sel !== "article" && sel !== "#content") fallback = best;
+  }
+  return fallback;
 }

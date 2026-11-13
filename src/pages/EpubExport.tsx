@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { db } from "@/services/db";
 import { generateEpub, generateTxt, generateHtml, type EpubChapter } from "@/services/epub";
+import { preflight, type Preflight } from "@/services/preflight";
 import { pickCoverFromGallery, generatePlaceholderCover, readCover } from "@/services/cover";
 import { normalizeLanguage } from "@/services/parser/base";
 import { Filesystem, Directory } from "@capacitor/filesystem";
@@ -27,6 +28,7 @@ export function EpubExport() {
   const [skipDuplicates, setSkipDuplicates] = useState(true);
   const [stats, setStats] = useState<{ downloaded: number; total: number; duplicates: number } | null>(null);
   const [notice, setNotice] = useState("");
+  const [check, setCheck] = useState<Preflight | null>(null);
   const [description, setDescription] = useState("");
   const [split, setSplit] = useState<SplitMode>("single");
   const [chapterCount, setChapterCount] = useState(50);
@@ -51,8 +53,14 @@ export function EpubExport() {
         setDescription(p.description ?? "");
       }
       const all = await db.getChapters(id);
-      const done = all.filter((c) => c.status === "downloaded");
-      if (mounted) setStats({ downloaded: done.length, total: all.length, duplicates: done.length - dedupeByContent(done).length });
+      // vyřazené alternativní verze do knihy nepatří
+      const done = all.filter((c) => c.status === "downloaded" && !c.excluded);
+      const total = all.filter((c) => !c.excluded).length;
+      const storedCover = await readCover(p.coverPath).catch(() => null);
+      if (mounted) {
+        setStats({ downloaded: done.length, total, duplicates: done.length - dedupeByContent(done).length });
+        setCheck(preflight(all, !!storedCover));
+      }
     };
     load();
     return () => { mounted = false; };
@@ -110,7 +118,8 @@ export function EpubExport() {
       }
 
       const chapters = await db.getChapters(p.id);
-      const downloaded = chapters.filter((c) => c.status === "downloaded") as ChapterPick[];
+      const wanted = chapters.filter((c) => !c.excluded);
+      const downloaded = wanted.filter((c) => c.status === "downloaded") as ChapterPick[];
       if (downloaded.length === 0) {
         setError("Žádné stažené kapitoly k exportu.");
         return;
@@ -133,7 +142,8 @@ export function EpubExport() {
         const notes: string[] = [];
         if (!coverToUse) notes.push("Kniha nemá obálku.");
         if (res.missing.length) notes.push(`${res.missing.length} kapitol nemělo uložený text a v knize chybí (např. ${res.missing.slice(0, 3).join(", ")}).`);
-        if (downloaded.length < chapters.length) notes.push(`Kniha obsahuje jen stažené kapitoly (${downloaded.length} z ${chapters.length}).`);
+        if (downloaded.length < wanted.length) notes.push(`Kniha je neúplná: obsahuje jen stažené kapitoly (${downloaded.length} z ${wanted.length}).`);
+        if (res.suspicious.length) notes.push(`U ${res.suspicious.length} kapitol zůstal text připomínající reklamu nebo navigaci (např. ${res.suspicious.slice(0, 3).join(", ")}) – opravte je v detailu projektu.`);
         setNotice(notes.join(" "));
       } else if (format === "txt") {
         out = await generateTxt(p, selected);
@@ -274,6 +284,14 @@ export function EpubExport() {
               </div>
               {stats.downloaded < stats.total && (
                 <div className="mt-1 text-xs text-amber-400">Kniha bude obsahovat jen stažené kapitoly, ve správném pořadí.</div>
+              )}
+              {check && (
+                <ul className="mt-3 space-y-1.5 text-xs" data-testid="preflight">
+                  {check.variantLabel && <li className="text-white/70">Verze kapitol v knize: <strong className="text-white">{check.variantLabel}</strong></li>}
+                  {check.issues.map((i, n) => (
+                    <li key={n} className={i.level === "warn" ? "text-amber-400" : "text-green-400"}>{i.level === "warn" ? "⚠ " : "✓ "}{i.message}</li>
+                  ))}
+                </ul>
               )}
               {stats.duplicates > 0 && (
                 <label className="mt-3 flex items-start gap-2 cursor-pointer">

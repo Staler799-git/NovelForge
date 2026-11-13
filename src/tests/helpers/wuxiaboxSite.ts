@@ -12,6 +12,8 @@ export const NOVEL_URL = `${ORIGIN}/novel/${SLUG}.html`;
 
 export interface SiteEntry {
   seq: number; // pořadí v URL
+  /** Přesný tvar čísla v adrese ("001"). Výchozí je `seq`. */
+  suffix?: string;
   label: string; // číslo zobrazené v katalogu
   title: string;
 }
@@ -33,7 +35,39 @@ export interface SiteOptions {
   chapterText?: (seq: number) => string;
   /** Stavový kód / HTML pro konkrétní kapitoly. */
   chapterOverride?: (seq: number) => { status: number; data: string } | undefined;
+  /**
+   * Přidá na stránku kapitoly prvky rozhraní (nápověda čtečky, blok doporučení,
+   * propagace webu): "outside" = vedle kontejneru s textem, "inside" = uvnitř něj.
+   */
+  ads?: "outside" | "inside";
 }
+
+const sfx = (e: SiteEntry) => e.suffix ?? String(e.seq);
+
+/**
+ * Katalog jako na skutečném webu: prvních `altCount` kapitol má dvě adresy
+ * (…_001.html = alternativní verze, …_1.html = hlavní řada), zbytek jen jednu.
+ */
+export function mixedCatalog(total: number, altCount: number): SiteEntry[] {
+  const out: SiteEntry[] = [];
+  for (let n = 1; n <= total; n++) {
+    if (n <= altCount) {
+      const padded = String(n).padStart(3, "0");
+      out.push({ seq: n, suffix: padded, label: padded, title: `Chapter ${padded}` });
+    }
+    out.push({ seq: n, label: String(n), title: `Chapter ${n} Placeholder Heading ${n}` });
+  }
+  return out;
+}
+
+const UI_BLOCKS = `
+      <div class="guide-message"><p>Tap the screen to use advanced tools</p><p>Tip: You can use left, right keyboard keys to browse between chapters.</p></div>
+      <p>Read the latest chapters at wuxiabox.com for free</p>
+      <section class="recommend"><h4>You'll Also Like</h4>
+        <ul><li><a href="/novel/other-sample-one.html">Other Sample Novel One</a></li>
+            <li><a href="/novel/other-sample-two.html">Other Sample Novel Two</a></li>
+            <li><a href="/novel/other-sample-two_12.html">Chapter 12 of Other Sample</a></li></ul>
+      </section>`;
 
 export function singleSeries(count: number): SiteEntry[] {
   return Array.from({ length: count }, (_, i) => ({
@@ -67,7 +101,7 @@ export function fillerText(seed: number, sentences = 14): string {
 function listItems(entries: SiteEntry[]): string {
   return entries
     .map(
-      (e) => `      <li><a href="/novel/${SLUG}_${e.seq}.html" title="${e.title}">
+      (e) => `      <li><a href="/novel/${SLUG}_${sfx(e)}.html" title="${e.title}">
         <span class="chapter-no">${e.label}</span>
         <strong class="chapter-title">${e.title}</strong>
         <time class="chapter-update">2 years ago</time></a></li>`,
@@ -139,8 +173,8 @@ ${listItems(pageEntries(index))}
       <p>${(opts.chapterText ?? fillerText)(e.seq)}</p>
       <div class="adsbygoogle">ADVERT</div>
       <p>Second paragraph &nbsp; with a break<br>and <em>emphasis</em> for entry ${e.seq}.</p>
-      <script>var x = "<p>not content</p>";</script>
-    </div>
+      <script>var x = "<p>not content</p>";</script>${opts.ads === "inside" ? UI_BLOCKS : ""}
+    </div>${opts.ads === "outside" ? UI_BLOCKS : ""}
     <div class="chapternav"><a href="/novel/${SLUG}_${e.seq + 1}.html">Next</a></div>
   </article>
   <footer>Footer links</footer>
@@ -173,7 +207,7 @@ ${listItems(pageEntries(index))}
       const seq = Number(m[1]);
       const override = opts.chapterOverride?.(seq);
       if (override) return respond(url, override.status, override.data);
-      const entry = opts.entries.find((e) => e.seq === seq);
+      const entry = opts.entries.find((e) => sfx(e) === m[1]);
       if (entry) return respond(url, 200, chapterHtml(entry));
     }
     return respond(url, 404, "<html><body>Not Found</body></html>");

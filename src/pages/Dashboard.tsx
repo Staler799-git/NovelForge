@@ -1,33 +1,14 @@
-import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { db } from "@/services/db";
-import { projectStore } from "@/store";
-import type { Project } from "@/types";
+import { downloadManager } from "@/services/downloader";
+import { projectStatus } from "@/services/status";
+import { useProjects } from "@/lib/useProjects";
 import { Card, SectionTitle, Badge, ProgressBar, Button, Cover } from "@/components/ui";
 import { domainOf } from "@/lib/utils";
 import { BookOpen, Download, FileText } from "lucide-react";
 
 export function Dashboard() {
   const navigate = useNavigate();
-  const [projects, setProjects] = useState<Project[]>([]);
-
-  useEffect(() => {
-    let mounted = true;
-    const load = async () => {
-      try {
-        const ps = await db.getProjects();
-        if (mounted) setProjects(ps);
-      } catch {
-        /* ignore */
-      }
-    };
-    load();
-    const unsub = projectStore.subscribe(load);
-    return () => {
-      mounted = false;
-      unsub();
-    };
-  }, []);
+  const { projects } = useProjects();
 
   const chapters = projects.reduce((s, p) => s + p.downloadedChapters, 0);
 
@@ -105,9 +86,10 @@ export function Dashboard() {
                   <ProgressBar value={p.progress} />
                 </div>
                 <div className="flex items-center gap-2">
-                  <Badge variant={p.status === "completed" ? "ok" : p.status === "downloading" ? "warn" : "muted"}>
-                    {p.status === "completed" ? "Hotovo" : p.status === "downloading" ? "Stahuje se" : "Připraveno"}
-                  </Badge>
+                  {(() => {
+                    const st = projectStatus(p, downloadManager.isDownloading(p.id));
+                    return <Badge variant={st.variant}>{st.label}</Badge>;
+                  })()}
                 </div>
               </div>
             </Card>

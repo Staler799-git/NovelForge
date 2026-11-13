@@ -3,6 +3,7 @@ import JSZip from "jszip";
 import { db } from "./db";
 import { storage } from "@/services/storage";
 import { escapeXml, sanitizeToXhtml } from "./content";
+import { stripBoilerplateXhtml, findBoilerplate } from "./clean";
 import { normalizeLanguage } from "./parser/base";
 import { bytesToBase64 } from "./http";
 import { extForMime } from "./cover";
@@ -19,6 +20,8 @@ export interface EpubBuildResult {
   /** Názvy kapitol, jejichž soubor se nepodařilo načíst (v knize chybí). */
   missing: string[];
   chapterCount: number;
+  /** Kapitoly, ve kterých i po vyčištění zůstal text připomínající reklamu/navigaci. */
+  suspicious: string[];
 }
 
 const esc = escapeXml;
@@ -39,13 +42,19 @@ function bodyTextFromFile(html: string): string {
  * dvakrát, a HTML se nepřevádělo na XHTML (soubory ze starších verzí obsahují
  * `<br>` a `&nbsp;`, což v EPUB není platné).
  */
-export function chapterBodyFromFile(html: string): string {
+export function chapterBodyFromFile(html: string, clean = true): string {
   // <head> se zahazuje: stačí tělo a parser nemá důvod sahat na styly.
   const doc = parseHtml(html.replace(/^<\?xml[^>]*\?>/, "").replace(/<head[\s>][\s\S]*?<\/head>/i, ""));
   const body = doc.querySelector(".chapter-body");
-  if (body) return sanitizeToXhtml(body.innerHTML);
-  for (const el of Array.from(doc.querySelectorAll("header.chapter-header"))) el.remove();
-  return sanitizeToXhtml(doc.body?.innerHTML ?? html);
+  let xhtml: string;
+  if (body) xhtml = sanitizeToXhtml(body.innerHTML);
+  else {
+    for (const el of Array.from(doc.querySelectorAll("header.chapter-header"))) el.remove();
+    xhtml = sanitizeToXhtml(doc.body?.innerHTML ?? html);
+  }
+  // Kapitoly stažené starší verzí mohou obsahovat nápovědu čtečky a blok
+  // doporučení – do knihy se nepřenesou, i když soubor ještě nebyl opraven.
+  return clean ? stripBoilerplateXhtml(xhtml).html : xhtml;
 }
 
 const STYLES_CSS = `
@@ -242,6 +251,7 @@ export async function buildEpubDetailed(
   const ordered = chapters.slice().sort((a, b) => a.orderIndex - b.orderIndex);
   const included: EpubChapter[] = [];
   const missing: string[] = [];
+  const suspicious: string[] = [];
   for (let i = 0; i < ordered.length; i++) {
     const c = ordered[i];
     let body = "";
@@ -255,6 +265,7 @@ export async function buildEpubDetailed(
     if (!body.trim()) {
       missing.push(c.title);
     } else {
+      if (findBoilerplate(body).length > 0) suspicious.push(c.title);
       zip.file(`OEBPS/${chapterFile(included.length)}`, chapterXhtml(c.title, body, lang));
       included.push(c);
     }
@@ -271,7 +282,7 @@ export async function buildEpubDetailed(
   zip.file("OEBPS/content.opf", opf(project, lang, included, cover, modified));
 
   const data = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", mimeType: "application/epub+zip" });
-  return { data, missing, chapterCount: included.length };
+  return { data, missing, chapterCount: included.length, suspicious };
 }
 
 export async function buildEpub(
@@ -289,7 +300,7 @@ export async function generateEpub(
   coverBase64?: string,
   coverMime = "image/jpeg",
   onProgress?: (done: number, total: number) => void,
-): Promise<{ path: string; size: number; missing: string[]; chapterCount: number }> {
+): Promise<{ path: string; size: number; missing: string[]; chapterCount: number; suspicious: string[] }> {
   await storage.init();
   const built = await buildEpubDetailed(project, chapters, coverBase64, coverMime, onProgress);
   const fileName = `${safeName(project.title)}-${project.id.slice(0, 8)}.epub`;
@@ -299,7 +310,7 @@ export async function generateEpub(
   await storage.writeBinary(path, bytesToBase64(built.data));
   const size = await storage.fileSize(path);
   await db.updateProject(project.id, { epubPath: path });
-  return { path, size: size ?? built.data.byteLength, missing: built.missing, chapterCount: built.chapterCount };
+  return { path, size: size ?? built.data.byteLength, missing: built.missing, chapterCount: built.chapterCount, suspicious: built.suspicious };
 }
 
 export async function generateTxt(project: Project, chapters: EpubChapter[]): Promise<{ path: string; size: number }> {
