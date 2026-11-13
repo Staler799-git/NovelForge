@@ -26,6 +26,10 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
     private var pendingCall: CAPPluginCall?
     private var renderWebView: WKWebView?
     private var timeoutWorkItem: DispatchWorkItem?
+    /// Prodleva po načtení stránky, než se přečte DOM (obsah dotahovaný skriptem).
+    private var settleDelayMs: Int = 0
+    /// Stránka naposledy ukázala automatické ověření prohlížeče (čeká se na její přesměrování).
+    private var sawBrowserCheck = false
 
     @objc public func render(_ call: CAPPluginCall) {
         guard let urlString = call.getString("url"), !urlString.isEmpty else {
@@ -40,6 +44,8 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
         cancelPending(with: "Render cancelled: a new render request started")
 
         pendingCall = call
+        settleDelayMs = max(0, min(call.getInt("delayMs") ?? 0, 15000))
+        sawBrowserCheck = false
 
         let webView = WKWebView(frame: .zero)
         webView.navigationDelegate = self
@@ -54,10 +60,13 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
 
         // Timeout after 30 seconds.
         let workItem = DispatchWorkItem { [weak self] in
+            let message = (self?.sawBrowserCheck ?? false)
+                ? "Browser verification page did not finish (site protection)"
+                : "Rendering timeout"
             self?.finish(with: nil, error: NSError(
                 domain: "WebRenderer",
                 code: -2,
-                userInfo: [NSLocalizedDescriptionKey: "Rendering timeout"]
+                userInfo: [NSLocalizedDescriptionKey: message]
             ))
         }
         timeoutWorkItem = workItem
@@ -103,9 +112,29 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
 extension WebRenderer: WKNavigationDelegate {
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard pendingCall != nil else { return }
+        let delay = settleDelayMs
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self, weak webView] in
+                guard let self = self, let webView = webView, self.renderWebView === webView else { return }
+                self.readDocument(webView)
+            }
+        } else {
+            readDocument(webView)
+        }
+    }
+
+    private func readDocument(_ webView: WKWebView) {
+        guard pendingCall != nil else { return }
         webView.evaluateJavaScript("document.documentElement.outerHTML") { [weak self] result, error in
             guard let self = self else { return }
             if let html = result as? String {
+                // Automatické ověření prohlížeče (bez zásahu uživatele) stránku samo
+                // přesměruje – počkáme na další načtení. Nic se neobchází: když ověření
+                // neskončí, vyprší časový limit a volající dostane chybu.
+                if html.count < 60000 && (html.contains("challenge-platform") || html.contains("<title>Just a moment")) {
+                    self.sawBrowserCheck = true
+                    return
+                }
                 self.finish(with: html, error: nil)
             } else {
                 self.finish(with: nil, error: error ?? NSError(

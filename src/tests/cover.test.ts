@@ -113,3 +113,139 @@ describe("stažení a uložení obálky", () => {
     expect(cover).toEqual({ base64: PNG, mime: "image/png" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// AVIF / HEIC
+// ---------------------------------------------------------------------------
+import { normalizeCover, pickCoverFromGallery } from "@/services/cover";
+import { Camera } from "@capacitor/camera";
+import { afterEach } from "vitest";
+
+/** Hlavička ISO BMFF: box `ftyp` s hlavní značkou a kompatibilními značkami + výplň. */
+function isoBmff(major: string, compatible: string[], pad = 64): string {
+  const size = 16 + compatible.length * 4;
+  const bytes = [0, 0, 0, size, ...[..."ftyp"].map((c) => c.charCodeAt(0)), ...[...major].map((c) => c.charCodeAt(0)), 0, 0, 0, 0];
+  for (const b of compatible) bytes.push(...[...b].map((c) => c.charCodeAt(0)));
+  return bytesToBase64(new Uint8Array([...bytes, ...new Array(pad).fill(7)]));
+}
+const AVIF = isoBmff("avif", ["avif", "mif1", "miaf", "MA1B"]);
+const AVIF_MIF1 = isoBmff("mif1", ["mif1", "avif", "miaf"]); // obecná hlavní značka, AVIF až v kompatibilních
+const AVIF_SEQ = isoBmff("avis", ["avis", "msf1", "iso8"]);
+const HEIC = isoBmff("heic", ["mif1", "heic"]);
+const MP4 = isoBmff("isom", ["isom", "iso2", "avc1", "mp41"]);
+const CONVERTED = bytesToBase64(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 9, 9, 9, 9, 9, 9, 9, 9]));
+
+/** Napodobí dekodér WKWebView: <img> + <canvas>. `decodes` určuje, které MIME typy „umí“. */
+function fakeDecoder(decodes: (mime: string) => boolean, size = { w: 2400, h: 3200 }) {
+  const drawn: Array<{ w: number; h: number }> = [];
+  const sources: string[] = [];
+  class FakeImage {
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    naturalWidth = 0;
+    naturalHeight = 0;
+    set src(v: string) {
+      sources.push(v.slice(0, 40));
+      const mime = v.slice(5, v.indexOf(";"));
+      queueMicrotask(() => {
+        if (decodes(mime)) {
+          this.naturalWidth = size.w;
+          this.naturalHeight = size.h;
+          this.onload?.();
+        } else this.onerror?.();
+      });
+    }
+  }
+  vi.stubGlobal("Image", FakeImage);
+  const realCreate = document.createElement.bind(document);
+  vi.spyOn(document, "createElement").mockImplementation(((tag: string) => {
+    if (tag !== "canvas") return realCreate(tag);
+    const canvas: any = { width: 0, height: 0 };
+    canvas.getContext = () => ({ fillStyle: "", fillRect: () => {}, drawImage: () => drawn.push({ w: canvas.width, h: canvas.height }) });
+    canvas.toDataURL = (type: string) => `data:${type};base64,${CONVERTED}`;
+    return canvas;
+  }) as any);
+  return { drawn, sources };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("AVIF a HEIC", () => {
+  it("rozpozná AVIF podle struktury souboru (box ftyp a značky), ne podle přípony", () => {
+    expect(sniffImageMime(AVIF)).toBe("image/avif");
+    expect(sniffImageMime(AVIF_MIF1)).toBe("image/avif");
+    expect(sniffImageMime(AVIF_SEQ)).toBe("image/avif");
+    expect(sniffImageMime(HEIC)).toBe("image/heic");
+    expect(sniffImageMime(MP4)).toBeNull(); // video není obálka
+    expect(sniffImageMime(bytesToBase64(new TextEncoder().encode("xxxxftypavif")))).toBeNull(); // nesmyslná délka boxu
+    expect(extForMime("image/avif")).toBe("avif");
+  });
+
+  it("AVIF z CDN s příponou .jpg a obecným Content-Type převede na JPEG", async () => {
+    const dec = fakeDecoder(() => true);
+    response = async () => ({ ok: true, status: 200, base64: AVIF, contentType: "application/octet-stream", url: "" });
+    const cover = await downloadCover("https://img.example-cdn.test/covers/7898.jpg?w=400", "https://wtr-lab.com/en/novel/7898/x");
+    expect(cover).toEqual({ base64: CONVERTED, mime: "image/jpeg" });
+    expect(dec.sources[0]).toMatch(/^data:image\/avif;base64,/);
+    expect(dec.drawn).toEqual([{ w: 1200, h: 1600 }]); // zmenšeno na max. 1600 px
+
+    const path = await saveCover(cover);
+    expect(path).toMatch(/^NovelForge\/covers\/cover-.*\.jpg$/);
+    expect(written.at(-1)!.encoding).toBeUndefined(); // binární zápis
+    expect(await readCover(path)).toEqual({ base64: CONVERTED, mime: "image/jpeg" });
+  });
+
+  it("server hlásí image/avif => už to není chyba „nevrací obrázek“", async () => {
+    fakeDecoder(() => true);
+    response = async () => ({ ok: true, status: 200, base64: AVIF_MIF1, contentType: "image/avif", url: "" });
+    await expect(downloadCover("https://img.example-cdn.test/c")).resolves.toMatchObject({ mime: "image/jpeg" });
+  });
+
+  it("když zařízení AVIF nedekóduje, ohlásí konkrétní chybu (a nic neuloží jako AVIF)", async () => {
+    fakeDecoder((mime) => mime !== "image/avif");
+    response = async () => ({ ok: true, status: 200, base64: AVIF, contentType: "image/avif", url: "" });
+    await expect(downloadCover("https://img.example-cdn.test/c.avif")).rejects.toThrow(/Obálku ve formátu AVIF se nepodařilo převést na JPEG \(systém obrázek nedekódoval\)/);
+    expect(written).toEqual([]);
+  });
+
+  it("JPEG a PNG zůstávají beze změny, WebP se převede; nepřevoditelný WebP se ponechá", async () => {
+    const dec = fakeDecoder(() => true);
+    expect(await normalizeCover({ base64: JPEG, mime: "image/jpeg" })).toEqual({ base64: JPEG, mime: "image/jpeg" });
+    expect(await normalizeCover({ base64: PNG, mime: "image/png" })).toEqual({ base64: PNG, mime: "image/png" });
+    expect(dec.sources).toEqual([]); // nic se zbytečně nepřekódovává
+    expect(await normalizeCover({ base64: WEBP, mime: "image/webp" })).toEqual({ base64: CONVERTED, mime: "image/jpeg" });
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    fakeDecoder(() => false);
+    expect(await normalizeCover({ base64: WEBP, mime: "image/webp" })).toEqual({ base64: WEBP, mime: "image/webp" });
+  });
+
+  it("typ se určuje z obsahu i u CDN bez přípony a se špatným Content-Type", async () => {
+    fakeDecoder(() => true);
+    for (const [data, expected] of [[JPEG, "image/jpeg"], [PNG, "image/png"], [WEBP, "image/jpeg"], [AVIF, "image/jpeg"]] as const) {
+      response = async () => ({ ok: true, status: 200, base64: data, contentType: "text/plain", url: "" });
+      expect((await downloadCover("https://img.example-cdn.test/_next/image?url=%2Fcover&w=256")).mime).toBe(expected);
+    }
+  });
+
+  it("obrázek z galerie ve formátu HEIC/AVIF se také převede", async () => {
+    fakeDecoder(() => true);
+    (Camera as any).getPhoto = vi.fn(async () => ({ base64String: HEIC }));
+    const picked = await pickCoverFromGallery();
+    expect(picked).toMatchObject({ mime: "image/jpeg", base64: CONVERTED });
+    expect(picked!.path).toMatch(/\.jpg$/);
+  });
+
+  it("požadavek dává přednost JPEG/PNG před AVIF", async () => {
+    const real = await vi.importActual<typeof import("@/services/http")>("@/services/http");
+    const fetchSpy = vi.fn(async (..._a: any[]) => new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), { status: 200, headers: { "content-type": "image/jpeg" } }));
+    vi.stubGlobal("fetch", fetchSpy);
+    await real.http.getBinary("https://img.example-cdn.test/c");
+    const accept = (fetchSpy.mock.calls[0][1] as any).headers.Accept as string;
+    expect(accept.indexOf("image/jpeg")).toBeLessThan(accept.indexOf("image/avif"));
+    expect(accept).toContain("image/avif");
+  });
+});

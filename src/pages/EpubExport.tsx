@@ -67,7 +67,10 @@ export function EpubExport() {
   }, [id]);
 
   const pickCover = async () => {
-    const picked = await pickCoverFromGallery();
+    const picked = await pickCoverFromGallery().catch((err: any) => {
+      window.alert(`${err?.message ?? "Obrázek se nepodařilo zpracovat"}. Vyberte jiný obrázek z galerie.`);
+      return null;
+    });
     if (picked) {
       setCoverBase64(picked.base64);
       setCoverMime(picked.mime);

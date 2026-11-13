@@ -159,6 +159,52 @@ export class HttpClient {
     }
   }
 
+  /** Odešle JSON metodou POST. Stejně jako `get` nevyhazuje chybu kvůli stavovému kódu. */
+  async postJson(url: string, body: unknown, opts: HttpOptions = {}): Promise<HttpResponse> {
+    const headers = { ...this.baseHeaders, Accept: "application/json", "Content-Type": "application/json", ...(opts.headers ?? {}) };
+    const timeout = opts.timeoutMs ?? 30000;
+    if (opts.signal?.aborted) throw new AbortedError();
+
+    if (Capacitor.isNativePlatform()) {
+      let res;
+      try {
+        res = await raceAbort(
+          CapacitorHttp.post({ url, headers, data: body, connectTimeout: timeout, readTimeout: timeout, responseType: "text" }),
+          opts.signal,
+        );
+      } catch (err) {
+        if (isAbort(err)) throw err;
+        throw new HttpError(describeNetworkError(err), undefined, url);
+      }
+      const status = Number(res.status ?? 0);
+      const data = res.data;
+      return {
+        url: res.url ?? url,
+        status,
+        ok: status >= 200 && status < 300,
+        data: typeof data === "string" ? data : data == null ? "" : JSON.stringify(data),
+        headers: (res.headers as Record<string, string>) ?? {},
+      };
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    const onAbort = () => controller.abort();
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
+      const text = await res.text();
+      return { url: res.url || url, status: res.status, ok: res.ok, data: text, headers: Object.fromEntries(res.headers.entries()) };
+    } catch (err) {
+      if (opts.signal?.aborted) throw new AbortedError();
+      if ((err as any)?.name === "AbortError") throw new HttpError("Vypršel časový limit požadavku", undefined, url);
+      throw new HttpError(describeNetworkError(err), undefined, url);
+    } finally {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
   /**
    * Stáhne binární soubor (obrázek) a vrátí ho jako base64.
    *
@@ -168,7 +214,8 @@ export class HttpClient {
   async getBinary(url: string, opts: HttpOptions = {}): Promise<BinaryResponse> {
     const headers = {
       ...this.baseHeaders,
-      Accept: "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+      // JPEG/PNG mají přednost (jsou to základní formáty EPUB); AVIF a WebP se přijmou a převedou.
+      Accept: "image/jpeg,image/png,image/webp;q=0.9,image/avif;q=0.8,image/*;q=0.7,*/*;q=0.5",
       ...(opts.headers ?? {}),
     };
     const timeout = opts.timeoutMs ?? 30000;

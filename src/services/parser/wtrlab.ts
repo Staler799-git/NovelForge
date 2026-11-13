@@ -1,26 +1,33 @@
 /**
  * WTR-LAB (wtr-lab.com).
  *
- * Web je aplikace v Next.js: stránka nese data v <script id="__NEXT_DATA__">
- * a část obsahu vykresluje až JavaScript. Parser proto:
- *   1) čte data ze stránky (__NEXT_DATA__, JSON-LD, Open Graph),
- *   2) když ve statickém HTML nejsou, nechá stránku vykreslit nativním
- *      WKWebView a čte výsledný DOM,
- *   3) nikdy nevolá žádné interní API webu – jeho adresy ani formát nejsou
- *      ověřené a mohou být chráněné.
+ * Web je aplikace v Next.js. Jak data zpřístupňuje (ověřeno ze zdrojových kódů
+ * tří udržovaných open-source čteček – WebToEpub, LNReader, QuickNovel –
+ * NIKOLI živým požadavkem z vývojového prostředí, odkud web není dostupný):
  *
- * DŮLEŽITÉ: struktura dat byla navržena bez přístupu k živému webu. Klíče se
- * proto nehledají na pevných cestách, ale podle tvaru dat, a každý krok má
- * kontrolu: když se novela nebo katalog nedají spolehlivě rozpoznat, parser
- * vyhodí chybu, místo aby vrátil název webu nebo jednu falešnou kapitolu.
+ *   - stránka novely nese v <script id="__NEXT_DATA__"> objekt
+ *     props.pageProps.serie.serie_data { raw_id, slug, chapter_count,
+ *     data: { title, author, description, image } }; v HTML je vidět jen
+ *     několik posledních kapitol,
+ *   - úplný seznam kapitol si stránka dotahuje z vlastního rozhraní
+ *     GET /api/chapters/{id}?start=A&end=B  ->  { chapters: [{ order, title }] },
+ *   - text kapitoly si stránka dotahuje z POST /api/reader/get.
  *
- * Přihlášení, CAPTCHA ani placený obsah se neobcházejí.
+ * Parser proto:
+ *   1) metadata čte ze stránky (statické HTML, případně vykreslení ve WKWebView),
+ *   2) katalog načítá po dávkách z /api/chapters a PŘED označením za kompletní
+ *      kontroluje pokrytí rozsahu 1…N, počet unikátních kapitol a mezery,
+ *   3) adresy kapitol nikdy neodhaduje – co web v seznamu nevrátil, v katalogu není,
+ *   4) formát každé odpovědi přísně ověřuje; neznámý tvar = chyba, ne odhad.
+ *
+ * Přihlášení, CAPTCHA/Turnstile, zamčené kapitoly ani šifrovaný obsah se neobcházejí.
  */
 import { NovelParser, ContentError, cleanText, findCoverUrl, normalizeLanguage, absoluteUrl } from "./base";
 import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
 import { cleanChapterElement, stripBoilerplateXhtml } from "@/services/clean";
 import { sanitizeToXhtml, assertChapterContent, escapeXml, htmlToText } from "@/services/content";
-import { isAbort } from "@/services/http";
+import { http, isAbort } from "@/services/http";
+import { numberCoverage, formatRanges } from "@/services/catalog";
 
 const SITE_NAMES = ["wtr-lab.com", "wtr-lab", "wtr lab"];
 const SITE_TITLE_RE = /^\s*(wtr[-\s]?lab)\s*$/i;
@@ -223,6 +230,68 @@ function stripSiteSuffix(title: string): string {
   return cleanText(title.replace(/\s*[-|–—·:]\s*wtr[-\s]?lab.*$/i, "").replace(/^wtr[-\s]?lab\s*[-|–—·:]\s*/i, ""));
 }
 
+const READER_MODES = ["ai", "web"];
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+function tryJson(text: string | null | undefined): unknown | null {
+  const s = (text ?? "").trim();
+  if (!s || (s[0] !== "{" && s[0] !== "[")) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Web v názvech a textu používá značky %{viditelný text|base64} (případně
+ * %{"viditelný text":"base64"}). Nahradí je čitelným textem.
+ */
+export function resolveTokens(text: string): string {
+  if (!text || text.indexOf("%{") < 0) return text;
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/%\{(?:"([^"]*)":\s*"?([A-Za-z0-9+/=_-]+)"?|([^|{}%\u0000-\u001f]+?)\s*\|\s*([A-Za-z0-9+/=_-]+))\}/g, (match, s1, b1, s2, b2) => {
+    const safe = String(s1 ?? s2 ?? "").trim();
+    const b64 = String(b1 ?? b2 ?? "").trim().replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+    let decoded = "";
+    try {
+      if (/^[A-Za-z0-9+/]+$/.test(b64) && b64.length % 4 !== 1) {
+        const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+        decoded = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+      }
+    } catch {
+      decoded = "";
+    }
+    return decoded || safe || match;
+  });
+}
+
+/** Odpověď /api/chapters: { chapters: [{ order, title }] } (případně pod `data`). Cokoli jiného => null. */
+export function readChapterBatch(json: unknown): Array<{ order: number; title: string }> | null {
+  const list = isObj(json) ? (Array.isArray(json.chapters) ? json.chapters : isObj(json.data) && Array.isArray(json.data.chapters) ? json.data.chapters : null) : null;
+  if (!list) return null;
+  const out: Array<{ order: number; title: string }> = [];
+  for (const x of list) {
+    if (!isObj(x)) return null;
+    const order = num(x.order);
+    if (order === null || !Number.isInteger(order)) return null;
+    out.push({ order, title: str(x.title) || str(x.name) });
+  }
+  return out;
+}
+
+/** Souvislé rozsahy z čísel: [3134,3135,3138] -> [[3134,3135],[3138,3138]] */
+function rangesOf(numbers: number[]): Array<[number, number]> {
+  const sorted = [...new Set(numbers)].sort((a, b) => a - b);
+  const out: Array<[number, number]> = [];
+  for (const n of sorted) {
+    const last = out[out.length - 1];
+    if (last && n === last[1] + 1) last[1] = n;
+    else out.push([n, n]);
+  }
+  return out;
+}
+
 export class WtrLabParser extends NovelParser {
   canHandle(url: string): boolean {
     try {
@@ -241,7 +310,7 @@ export class WtrLabParser extends NovelParser {
   }
 
   /** Statické HTML; když neobsahuje použitelná data, zkusí vykreslení ve WKWebView. */
-  private async load(url: string, usable: (html: string) => boolean, opts?: FetchOptions): Promise<string> {
+  private async load(url: string, usable: (html: string) => boolean, opts?: FetchOptions, renderDelayMs = 0): Promise<string> {
     let html = "";
     let firstError: unknown = null;
     try {
@@ -253,7 +322,7 @@ export class WtrLabParser extends NovelParser {
     if (html && usable(html)) return html;
     try {
       const { renderHtml } = await import("@/services/render");
-      const rendered = await renderHtml(url);
+      const rendered = await renderHtml(url, { delayMs: renderDelayMs });
       if (opts?.signal?.aborted) throw new DOMException("Přerušeno", "AbortError");
       if (rendered && usable(rendered)) return rendered;
       if (rendered && !html) html = rendered;
@@ -310,9 +379,9 @@ export class WtrLabParser extends NovelParser {
       );
     }
     return {
-      title: serie.title,
-      author: serie.author,
-      description: serie.description ? htmlToText(serie.description) : undefined,
+      title: resolveTokens(serie.title),
+      author: resolveTokens(serie.author),
+      description: serie.description ? htmlToText(resolveTokens(serie.description)) : undefined,
       language: normalizeLanguage(t.lang, "en"),
       coverUrl: serie.cover ? absoluteUrl(t.novelUrl, serie.cover) : undefined,
       sourceUrl: t.novelUrl,
@@ -325,62 +394,260 @@ export class WtrLabParser extends NovelParser {
     return (await this.fetchCatalog(url, opts)).chapters;
   }
 
+  /** Prodleva mezi dávkami katalogu (ms). */
+  catalogDelayMs = 400;
+  /** Nejkratší odstup mezi požadavky na text kapitol (ms) – web omezuje rychlost. */
+  chapterIntervalMs = 3000;
+  /** Prodleva po načtení stránky ve WKWebView, než se čte text dotahovaný skriptem. */
+  renderDelayMs = 4000;
+  private lastChapterAt = 0;
+  private preferredMode: string | null = null;
+
+  /**
+   * Načte JSON z datového rozhraní webu – stejného, které používá stránka sama.
+   * Nejdřív běžným požadavkem; když odpověď není JSON (web vrátil ověření
+   * prohlížeče), otevře tutéž adresu ve WKWebView a přečte zobrazený dokument.
+   * Vrací i důvod neúspěchu, aby ho šlo ukázat uživateli.
+   */
+  private async fetchJson(url: string, referer: string, opts?: FetchOptions): Promise<{ json: unknown | null; reason: string }> {
+    let reason = "";
+    try {
+      const res = await http.get(url, { timeoutMs: 30000, signal: opts?.signal, headers: { Accept: "application/json", Referer: referer } });
+      const parsed = tryJson(res.data);
+      if (res.ok && parsed !== null) return { json: parsed, reason: "" };
+      reason = !res.ok ? `HTTP ${res.status}` : "odpověď není JSON";
+      if (/just a moment|challenge-platform|cf-chl/i.test(res.data ?? "")) reason += " (web vyžaduje ověření prohlížeče)";
+      if (res.status === 404 || res.status === 410) return { json: null, reason };
+    } catch (err) {
+      if (isAbort(err)) throw err;
+      reason = (err as Error)?.message || "chyba sítě";
+    }
+    try {
+      const { renderHtml } = await import("@/services/render");
+      const rendered = await renderHtml(url);
+      if (opts?.signal?.aborted) throw new DOMException("Přerušeno", "AbortError");
+      const parsed = tryJson(this.parseHtml(rendered).body?.textContent ?? "");
+      if (parsed !== null) return { json: parsed, reason: "" };
+      reason += "; ani ve WKWebView adresa nevrátila data";
+    } catch (err) {
+      if (isAbort(err)) throw err;
+      reason += `; WKWebView: ${(err as Error)?.message ?? "není k dispozici"}`;
+    }
+    return { json: null, reason };
+  }
+
+  /**
+   * Úplný seznam kapitol z rozhraní webu /api/chapters/{id}?start=&end=
+   * (po dávkách). Formát odpovědi se přísně kontroluje; cokoli jiného než
+   * pole objektů s číslem kapitoly se zahodí.
+   */
+  private async fetchChapterIndex(
+    t: WtrUrl,
+    declared: number | null,
+    opts?: FetchOptions,
+  ): Promise<{ titles: Map<number, string>; failed: Array<[number, number]>; reason: string; batches: number }> {
+    const titles = new Map<number, string>();
+    const failed: Array<[number, number]> = [];
+    let reason = "";
+    let batches = 0;
+    const BATCH = 500;
+    const planned = declared ? Math.ceil(declared / BATCH) : undefined;
+    for (let start = 1, guard = 0; guard < 400; start += BATCH, guard++) {
+      if (opts?.signal?.aborted) throw new DOMException("Přerušeno", "AbortError");
+      const end = start + BATCH - 1;
+      const withinDeclared = declared !== null && start <= declared;
+      if (guard > 0 && this.catalogDelayMs > 0) await sleep(this.catalogDelayMs);
+      const { json, reason: why } = await this.fetchJson(`${t.origin}/api/chapters/${t.id}?start=${start}&end=${end}`, t.novelUrl, opts);
+      const list = json === null ? null : readChapterBatch(json);
+      if (list === null) {
+        reason = reason || why || "neočekávaný formát odpovědi";
+        failed.push([start, declared !== null ? Math.min(end, Math.max(declared, start)) : end]);
+        // První dávka selhala => rozhraní není dostupné. Jinak zkusit ještě další dávky v uváděném rozsahu.
+        if (titles.size === 0 || failed.length >= 3 || !(declared !== null && end < declared)) break;
+        continue;
+      }
+      batches++;
+      let added = 0;
+      for (const c of list) {
+        if (c.order < 1 || titles.has(c.order)) continue;
+        titles.set(c.order, c.title);
+        added++;
+      }
+      opts?.onProgress?.({ pagesLoaded: batches, pagesTotal: planned, chaptersFound: titles.size });
+      if (list.length === 0 && !withinDeclared) break; // za koncem katalogu
+      if (added === 0 && list.length > 0) break; // server rozsah ignoruje a vrací stále totéž
+      if (declared === null && list.length < BATCH) break;
+      if (declared !== null && end >= declared && list.length < BATCH) break;
+    }
+    return { titles, failed, reason, batches };
+  }
+
   async fetchCatalog(url: string, opts?: FetchOptions): Promise<CatalogResult> {
     const t = this.target(url);
     const chapterUrl = (n: number) => `${t.novelUrl}/chapter-${n}`;
-    const read = (html: string) => {
+
+    // 1) stránka novely: počet kapitol uváděný webem + to, co je na stránce vidět
+    const readPage = (html: string) => {
       const data = extractNextData(html);
-      const listed = data ? findChapterList(data) : [];
+      const onPage = new Map<number, string>();
+      for (const c of data ? findChapterList(data) : []) if (c.order >= 1) onPage.set(c.order, c.title);
       const doc = this.parseHtml(html);
-      const linked = new Map<number, string>();
       for (const a of Array.from(doc.querySelectorAll('a[href*="/chapter-"]'))) {
         const target = parseWtrUrl(absoluteUrl(t.novelUrl, a.getAttribute("href") ?? ""));
-        if (!target || target.id !== t.id || target.chapter === null) continue;
+        if (!target || target.id !== t.id || target.chapter === null || target.chapter < 1) continue;
         const text = cleanText(a.textContent ?? "");
-        if (!linked.has(target.chapter) || (text.length > (linked.get(target.chapter) ?? "").length && text.length < 200)) linked.set(target.chapter, text);
+        if (!onPage.get(target.chapter) && text.length < 200) onPage.set(target.chapter, text);
       }
-      return { listed, linked, count: this.readSerie(html, t)?.count ?? null };
+      return { onPage, count: this.readSerie(html, t)?.count ?? null };
     };
-
-    const html = await this.load(
-      t.novelUrl,
-      (h) => {
-        const r = read(h);
-        return r.listed.length > 0 || r.count !== null || r.linked.size >= 2;
-      },
-      opts,
-    );
-    const { listed, linked, count } = read(html);
-    const warnings: string[] = [];
-    let chapters: ParserChapter[] = [];
-    let complete = false;
-
-    if (listed.length > 0) {
-      chapters = listed.map((c, i) => ({ title: c.title || `Chapter ${c.order}`, url: chapterUrl(c.order), orderIndex: i, label: String(c.order) }));
-      complete = count === null || listed.length >= count;
-      if (!complete) warnings.push(`Web uvádí ${count} kapitol, seznam na stránce jich obsahuje ${listed.length}. Katalog není kompletní.`);
-    } else if (count !== null && count > 0) {
-      // Adresy kapitol jsou na WTR-LAB číslované souvisle (…/chapter-1 až …/chapter-N).
-      chapters = Array.from({ length: count }, (_, i) => ({
-        title: linked.get(i + 1) || `Chapter ${i + 1}`,
-        url: chapterUrl(i + 1),
-        orderIndex: i,
-        label: String(i + 1),
-      }));
-      complete = false;
-      warnings.push(
-        `Stránka neobsahuje seznam kapitol, jen jejich počet (${count}). Adresy kapitol 1–${count} byly odvozeny z číslování webu a nejsou jednotlivě ověřené; názvy se doplní při stahování.`,
-      );
-    } else if (linked.size >= 2) {
-      const nums = [...linked.keys()].sort((a, b) => a - b);
-      chapters = nums.map((n, i) => ({ title: linked.get(n) || `Chapter ${n}`, url: chapterUrl(n), orderIndex: i, label: String(n) }));
-      complete = false;
-      warnings.push(`Na stránce bylo nalezeno jen ${nums.length} odkazů na kapitoly a web neuvádí jejich celkový počet. Katalog je pravděpodobně neúplný.`);
-    } else {
-      throw new ContentError("Katalog kapitol nebyl spolehlivě rozpoznán. WTR-LAB nevrátil seznam ani počet kapitol (web možná vyžaduje přihlášení nebo změnil strukturu).", false);
+    let page = { onPage: new Map<number, string>(), count: null as number | null };
+    let pageError = "";
+    try {
+      page = readPage(await this.load(t.novelUrl, (h) => readPage(h).count !== null, opts));
+    } catch (err) {
+      if (isAbort(err)) throw err;
+      pageError = (err as Error)?.message ?? "";
     }
-    opts?.onProgress?.({ pagesLoaded: 1, pagesTotal: 1, chaptersFound: chapters.length });
-    return { chapters, pagesLoaded: 1, declaredTotal: count ?? undefined, complete, aborted: false, warnings };
+    const declared = page.count;
+
+    // 2) úplný seznam z rozhraní webu
+    const index = await this.fetchChapterIndex(t, declared, opts);
+    let source = index.titles;
+    let fromPageOnly = false;
+    if (source.size === 0) {
+      // 3) rozhraní není dostupné: seznam ze stránky se použije JEN když pokrývá celý rozsah
+      const pageCov = numberCoverage([...page.onPage.keys()], declared);
+      if (!pageCov.complete) {
+        const seen = page.onPage.size > 0 ? ` Na stránce novely ${page.onPage.size === 1 ? "je vidět jen 1 kapitola" : `je vidět jen ${page.onPage.size} kapitol`} (${formatRanges(rangesOf([...page.onPage.keys()]))}) – to není katalog.` : "";
+        throw new ContentError(
+          `Katalog kapitol nebyl spolehlivě rozpoznán. ${declared !== null ? `WTR-LAB uvádí ${declared} kapitol, ale ` : ""}úplný seznam se nepodařilo načíst (${index.reason || pageError || "rozhraní webu neodpovědělo"}).${seen} Projekt nebyl vytvořen; adresy kapitol se neodhadují.`,
+          false,
+        );
+      }
+      source = page.onPage;
+      fromPageOnly = true;
+    }
+
+    // 4) kontrola pokrytí: počet unikátních kapitol, rozsah, skutečné mezery
+    const orders = [...source.keys()].sort((a, b) => a - b);
+    const cov = numberCoverage(orders, declared);
+    const warnings: string[] = [];
+    if (!cov.complete) {
+      warnings.push(
+        `Katalog NENÍ kompletní: ověřeno ${cov.unique} kapitol${cov.expectedLast ? ` z ${cov.expectedLast}` : ""}, chybí ${cov.missingCount} (${formatRanges(cov.missing)}). Chybějící kapitoly se nestáhnou.`,
+      );
+      if (index.failed.length > 0) warnings.push(`Část seznamu se nepodařilo načíst (${index.reason || "chyba webu"}): rozsahy ${formatRanges(index.failed)}. Zkuste detekci později znovu.`);
+    }
+    if (declared !== null && cov.max !== null && cov.max > declared) {
+      warnings.push(`Seznam obsahuje kapitoly až do čísla ${cov.max}; stránka novely uvádí ${declared}.`);
+    }
+    if (declared === null) warnings.push("Stránka novely neuvádí počet kapitol; úplnost se ověřila jen podle souvislosti číslování.");
+    if (fromPageOnly) warnings.push("Seznam kapitol pochází přímo ze stránky novely (datové rozhraní webu nebylo dostupné).");
+
+    const chapters: ParserChapter[] = orders.map((n, i) => ({
+      title: resolveTokens(source.get(n) ?? "") || `Chapter ${n}`,
+      url: chapterUrl(n),
+      orderIndex: i,
+      label: String(n),
+    }));
+    opts?.onProgress?.({ pagesLoaded: Math.max(1, index.batches), pagesTotal: Math.max(1, index.batches), chaptersFound: chapters.length });
+    return { chapters, pagesLoaded: Math.max(1, index.batches), declaredTotal: declared ?? undefined, complete: cov.complete, aborted: false, warnings };
+  }
+
+  /**
+   * Text kapitoly z rozhraní čtečky webu (/api/reader/get) – stejný požadavek,
+   * jaký posílá stránka kapitoly. Vrací null + důvod, když rozhraní text
+   * nevydá v čitelné podobě (ověření, šifrovaný obsah); pak se použije
+   * vykreslení stránky. Nic se nedešifruje a žádné ověření se neobchází.
+   */
+  private async readerApi(t: WtrUrl, pageUrl: string, opts?: FetchOptions): Promise<{ chapter: { title: string; html: string } | null; reason: string }> {
+    const modes = this.preferredMode ? [this.preferredMode, ...READER_MODES.filter((m) => m !== this.preferredMode)] : READER_MODES;
+    const reasons: string[] = [];
+    for (const mode of modes) {
+      let res;
+      try {
+        res = await http.postJson(
+          `${t.origin}/api/reader/get`,
+          { translate: mode, language: t.lang, raw_id: Number(t.id), chapter_no: t.chapter, retry: false, force_retry: false },
+          { signal: opts?.signal, timeoutMs: 30000, headers: { Referer: pageUrl } },
+        );
+      } catch (err) {
+        if (isAbort(err)) throw err;
+        reasons.push(`${mode}: ${(err as Error)?.message ?? "chyba sítě"}`);
+        continue;
+      }
+      const json = tryJson(res.data);
+      if (!isObj(json)) {
+        reasons.push(`${mode}: HTTP ${res.status}, odpověď není JSON${/just a moment|challenge-platform/i.test(res.data ?? "") ? " (ověření prohlížeče)" : ""}`);
+        continue;
+      }
+      if (json.code === "CHAPTER_LOCKED" || (isObj(json.chapter) && json.chapter.locked === true)) {
+        reasons.push(`${mode}: kapitola je v tomto překladu zamčená`);
+        continue;
+      }
+      if (json.requireTurnstile || json.code === 1401) {
+        reasons.push(`${mode}: web vyžaduje ověření (Turnstile)`);
+        break; // ověření se týká celé čtečky, další režim nemá smysl zkoušet
+      }
+      if (!res.ok || json.success === false || json.error) {
+        reasons.push(`${mode}: HTTP ${res.status}${typeof json.error === "string" ? ` – ${json.error}` : ""}${typeof json.message === "string" ? ` – ${json.message}` : ""}`);
+        continue;
+      }
+      let content: unknown = isObj(json.data) ? json.data.data : undefined;
+      if (!(isObj(content) && content.body !== undefined) && typeof json.content_url === "string" && json.content_url) {
+        const target = absoluteUrl(t.origin, json.content_url);
+        let host = "";
+        try {
+          host = new URL(target).hostname;
+        } catch {
+          /* neplatná adresa */
+        }
+        if (!/(^|\.)wtr-lab\.com$/i.test(host)) {
+          reasons.push(`${mode}: obsah odkazuje mimo web`);
+          continue;
+        }
+        const { json: payload, reason } = await this.fetchJson(target, pageUrl, opts);
+        content = isObj(payload) && isObj(payload.data) ? payload.data.data : undefined;
+        if (!isObj(content)) {
+          reasons.push(`${mode}: obsah kapitoly se nepodařilo načíst (${reason || "neočekávaný formát"})`);
+          continue;
+        }
+      }
+      if (!isObj(content) || content.body === undefined) {
+        reasons.push(`${mode}: odpověď neobsahuje text`);
+        continue;
+      }
+      if (!Array.isArray(content.body) || !content.body.every((x) => typeof x === "string")) {
+        reasons.push(`${mode}: text je v podobě, kterou aplikace nečte (chráněný obsah)`);
+        continue;
+      }
+      const terms = isObj(content.glossary_data) && Array.isArray(content.glossary_data.terms) ? (content.glossary_data.terms as unknown[]) : [];
+      const patch = Array.isArray(content.patch) ? (content.patch as unknown[]) : [];
+      const fix = (text: string) => {
+        let out = text.replace(/※(\d+)[⛬〓]/g, (m, i) => {
+          const term = terms[Number(i)];
+          const value = Array.isArray(term) ? term[0] : undefined;
+          return typeof value === "string" && value ? value : m;
+        });
+        for (const p of patch) if (isObj(p) && typeof p.zh === "string" && p.zh && typeof p.en === "string") out = out.split(p.zh).join(` ${p.en}`);
+        return resolveTokens(out);
+      };
+      const paragraphs = (content.body as string[]).filter((x) => x.trim() && x.trim() !== "[image]").map(fix);
+      if (paragraphs.some((p) => /※\d+[⛬〓]/.test(p))) {
+        reasons.push(`${mode}: v textu zůstaly nevyplněné zástupné značky`);
+        continue;
+      }
+      const xhtml = paragraphs.flatMap((p) => p.split(/\n+/)).map((p) => p.trim()).filter(Boolean).map((p) => `<p>${escapeXml(p)}</p>`).join("\n");
+      const cleaned = stripBoilerplateXhtml(xhtml, { siteNames: SITE_NAMES }).html;
+      if (htmlToText(cleaned).length < 120) {
+        reasons.push(`${mode}: text je příliš krátký`);
+        continue;
+      }
+      this.preferredMode = mode;
+      const rawTitle = (isObj(json.chapter) && typeof json.chapter.title === "string" && json.chapter.title) || (typeof content.title === "string" ? content.title : "");
+      return { chapter: { title: fix(rawTitle), html: cleaned }, reason: "" };
+    }
+    return { chapter: null, reason: reasons.join("; ") };
   }
 
   /** Text kapitoly z HTML (data stránky, nebo vykreslený DOM). Vrací null, když v něm není. */
@@ -419,11 +686,24 @@ export class WtrLabParser extends NovelParser {
   async fetchChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string }> {
     const t = this.target(url);
     if (t.chapter === null) throw new ContentError("Adresa neodkazuje na kapitolu.", false);
-    const html = await this.load(url, (h) => !!this.readChapter(h), opts);
-    const ch = this.readChapter(html);
+
+    // odstup mezi kapitolami – web omezuje rychlost požadavků
+    const now = Date.now();
+    const slot = Math.max(now, this.lastChapterAt + this.chapterIntervalMs); // i souběžná stahování jdou za sebou
+    this.lastChapterAt = slot;
+    if (slot > now) await sleep(slot - now);
+    if (opts?.signal?.aborted) throw new DOMException("Přerušeno", "AbortError");
+
+    // 1) rozhraní čtečky, 2) stránka kapitoly (statická data, pak vykreslení ve WKWebView)
+    const api = await this.readerApi(t, url, opts);
+    let ch = api.chapter;
+    if (!ch) {
+      const html = await this.load(url, (h) => !!this.readChapter(h), opts, this.renderDelayMs);
+      ch = this.readChapter(html);
+    }
     if (!ch) {
       throw new ContentError(
-        "Text kapitoly se na WTR-LAB nepodařilo načíst – stránka ho nevrátila ani po vykreslení. Web možná vyžaduje přihlášení nebo ověření; to aplikace neobchází.",
+        `Text kapitoly ${t.chapter} se na WTR-LAB nepodařilo načíst – stránka ho nevrátila ani po vykreslení.${api.reason ? ` Rozhraní čtečky: ${api.reason}.` : ""} Web možná vyžaduje přihlášení nebo ověření; to aplikace neobchází.`,
       );
     }
     assertChapterContent(ch.html);

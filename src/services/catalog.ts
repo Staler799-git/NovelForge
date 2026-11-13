@@ -538,3 +538,67 @@ export async function verifyAlternatives(
         : `Nepodařilo se potvrdit, že obě verze kapitol ${range} vyprávějí totéž. Rozhodněte ručně: bezpečná volba je hlavní řada, která pokrývá celou knihu.`,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Pokrytí číselného rozsahu (kontrola úplnosti katalogu)
+// ---------------------------------------------------------------------------
+
+export interface NumberCoverage {
+  /** Počet různých čísel kapitol. */
+  unique: number;
+  /** Kolik položek se opakovalo. */
+  duplicates: number;
+  min: number | null;
+  max: number | null;
+  /** Horní mez, proti které se kontrolovalo (větší z nejvyššího čísla a počtu uváděného webem). */
+  expectedLast: number | null;
+  /** Skutečné mezery jako rozsahy [od, do] včetně. */
+  missing: Array<[number, number]>;
+  missingCount: number;
+  /** Úplné jen když čísla pokrývají 1…expectedLast bez mezer. */
+  complete: boolean;
+}
+
+/**
+ * Ověří, že čísla kapitol souvisle pokrývají rozsah 1…N.
+ * `declared` je počet, který uvádí web; katalog kratší než tento počet úplný není.
+ */
+export function numberCoverage(numbers: number[], declared?: number | null): NumberCoverage {
+  const set = new Set(numbers.filter((n) => Number.isInteger(n) && n >= 1));
+  const sorted = [...set].sort((a, b) => a - b);
+  const min = sorted.length ? sorted[0] : null;
+  const max = sorted.length ? sorted[sorted.length - 1] : null;
+  const expectedLast = Math.max(max ?? 0, declared && declared > 0 ? declared : 0) || null;
+  const missing: Array<[number, number]> = [];
+  let missingCount = 0;
+  if (expectedLast !== null) {
+    let next = 1;
+    for (const n of sorted) {
+      if (n > next) {
+        missing.push([next, n - 1]);
+        missingCount += n - next;
+      }
+      next = n + 1;
+    }
+    if (next <= expectedLast) {
+      missing.push([next, expectedLast]);
+      missingCount += expectedLast - next + 1;
+    }
+  }
+  return {
+    unique: set.size,
+    duplicates: numbers.length - set.size,
+    min,
+    max,
+    expectedLast,
+    missing,
+    missingCount,
+    complete: set.size > 0 && missingCount === 0,
+  };
+}
+
+/** „1–3133, 3140, 3150–3152 a další“ */
+export function formatRanges(ranges: Array<[number, number]>, limit = 6): string {
+  const parts = ranges.slice(0, limit).map(([a, b]) => (a === b ? String(a) : `${a}–${b}`));
+  return parts.join(", ") + (ranges.length > limit ? ` a další (${ranges.length - limit} rozsahů)` : "");
+}

@@ -170,7 +170,10 @@ export function ProjectDetail() {
   };
 
   const changeCover = async () => {
-    const picked = await pickCoverFromGallery();
+    const picked = await pickCoverFromGallery().catch((err: any) => {
+      window.alert(`${err?.message ?? "Obrázek se nepodařilo zpracovat"}. Vyberte jiný obrázek z galerie.`);
+      return null;
+    });
     if (!picked) return;
     await db.updateProject(project.id, { coverPath: picked.path });
     await loadProject();
