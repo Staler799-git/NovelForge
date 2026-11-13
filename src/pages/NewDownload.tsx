@@ -180,7 +180,13 @@ export function NewDownload() {
   };
 
   const pickCover = async () => {
-    const picked = await pickCoverFromGallery();
+    let picked;
+    try {
+      picked = await pickCoverFromGallery();
+    } catch (err: any) {
+      setCoverNote(`${err?.message ?? "Obrázek se nepodařilo zpracovat"}. Vyberte jiný obrázek z galerie.`);
+      return;
+    }
     if (!picked) return;
     setCover({ base64: picked.base64, mime: picked.mime });
     setCoverPath(picked.path);

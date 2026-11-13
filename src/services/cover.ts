@@ -28,7 +28,13 @@ const EXT_BY_MIME: Record<string, string> = {
   "image/gif": "gif",
   "image/webp": "webp",
   "image/svg+xml": "svg",
+  "image/avif": "avif",
+  "image/heic": "heic",
 };
+
+/** Formáty, které smí být v EPUB a které zobrazí každá čtečka. */
+const EPUB_SAFE = new Set(["image/jpeg", "image/png"]);
+const FORMAT_NAME: Record<string, string> = { "image/avif": "AVIF", "image/heic": "HEIC", "image/webp": "WebP", "image/gif": "GIF" };
 
 export function extForMime(mime: string): string {
   return EXT_BY_MIME[mime] ?? "jpg";
@@ -42,7 +48,7 @@ export function extForMime(mime: string): string {
 export function sniffImageMime(base64: string): string | null {
   let b: Uint8Array;
   try {
-    b = base64ToBytes(base64.slice(0, 64));
+    b = base64ToBytes(base64.slice(0, 256)); // 192 bajtů – stačí i na delší hlavičku ISO BMFF
   } catch {
     return null;
   }
@@ -50,8 +56,29 @@ export function sniffImageMime(base64: string): string | null {
   if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
   if (b.length >= 6 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "image/gif";
   if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+  const iso = sniffIsoBmff(b);
+  if (iso) return iso;
   const head = String.fromCharCode(...b).trimStart().toLowerCase();
   if (head.startsWith("<svg") || head.startsWith("<?xml")) return "image/svg+xml";
+  return null;
+}
+
+/**
+ * AVIF a HEIC jsou soubory ISO BMFF: první box je `ftyp` s hlavní značkou
+ * (major brand) a seznamem kompatibilních značek. AVIF se pozná podle značky
+ * `avif`/`avis` – i když je hlavní značka obecná (`mif1`, `msf1`).
+ */
+function sniffIsoBmff(b: Uint8Array): string | null {
+  if (b.length < 12) return null;
+  const tag = (i: number) => String.fromCharCode(b[i], b[i + 1], b[i + 2], b[i + 3]);
+  if (tag(4) !== "ftyp") return null;
+  const size = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+  if (size < 16 || size > 4096) return null;
+  const end = Math.min(size, b.length);
+  const brands = [tag(8)];
+  for (let i = 16; i + 4 <= end; i += 4) brands.push(tag(i));
+  if (brands.some((x) => x === "avif" || x === "avis")) return "image/avif";
+  if (brands.some((x) => ["heic", "heix", "heim", "heis", "hevc", "hevx"].includes(x))) return "image/heic";
   return null;
 }
 
@@ -60,31 +87,46 @@ export function sniffImageMime(base64: string): string | null {
  * WebP ani GIF nejsou v EPUB 3 základní typy obrázků – některé čtečky by
  * obálku nezobrazily. Když převod není možný, vrátí původní data.
  */
-async function toJpeg(data: CoverData): Promise<CoverData> {
-  if (typeof document === "undefined" || typeof Image === "undefined") return data;
+async function decodeToJpeg(data: CoverData): Promise<CoverData> {
+  if (typeof document === "undefined" || typeof Image === "undefined") throw new Error("prostředí neumí dekódovat obrázky");
+  const img = new Image();
+  const loaded = new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("systém obrázek nedekódoval"));
+    setTimeout(() => reject(new Error("dekódování trvalo příliš dlouho")), 10000);
+  });
+  // WKWebView (iOS 16+) dekóduje AVIF, HEIC i WebP systémovým ImageIO.
+  img.src = `data:${data.mime};base64,${data.base64}`;
+  await loaded;
+  if (!img.naturalWidth || !img.naturalHeight) throw new Error("obrázek má nulové rozměry");
+  const scale = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight, 1));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("plátno pro převod není k dispozici");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const base64 = (canvas.toDataURL("image/jpeg", 0.9).split(",")[1] ?? "").replace(/\s+/g, "");
+  if (!base64 || sniffImageMime(base64) !== "image/jpeg") throw new Error("převod nevytvořil platný JPEG");
+  return { base64, mime: "image/jpeg" };
+}
+
+/**
+ * Zajistí, že obálka je JPEG nebo PNG (základní formáty EPUB 3).
+ *  - JPEG/PNG/SVG zůstávají beze změny,
+ *  - WebP a GIF se převedou, a když to nejde, ponechají se (většina čteček je zobrazí),
+ *  - AVIF a HEIC se převést MUSÍ – jinak chyba s konkrétním důvodem.
+ */
+export async function normalizeCover(data: CoverData): Promise<CoverData> {
+  if (EPUB_SAFE.has(data.mime) || data.mime === "image/svg+xml") return data;
   try {
-    const img = new Image();
-    const loaded = new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve();
-      img.onerror = () => reject(new Error("decode"));
-      setTimeout(() => reject(new Error("timeout")), 8000);
-    });
-    img.src = `data:${data.mime};base64,${data.base64}`;
-    await loaded;
-    const scale = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight, 1));
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
-    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return data;
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    const url = canvas.toDataURL("image/jpeg", 0.9);
-    const base64 = url.split(",")[1] ?? "";
-    if (!base64 || sniffImageMime(base64) !== "image/jpeg") return data;
-    return { base64, mime: "image/jpeg" };
-  } catch {
+    return await decodeToJpeg(data);
+  } catch (err: any) {
+    if (data.mime === "image/avif" || data.mime === "image/heic") {
+      throw new Error(`Obálku ve formátu ${FORMAT_NAME[data.mime]} se nepodařilo převést na JPEG (${err?.message ?? "neznámá chyba"})`);
+    }
     return data;
   }
 }
@@ -113,8 +155,7 @@ export async function downloadCover(url: string, referer?: string, signal?: Abor
     if (err?.name === "AbortError" || !referer) throw err;
     data = await attempt({}); // některé CDN naopak cizí Referer odmítají
   }
-  if (data.mime === "image/webp" || data.mime === "image/gif") data = await toJpeg(data);
-  return data;
+  return normalizeCover(data);
 }
 
 /** Uloží obálku BINÁRNĚ do Documents/NovelForge/covers a vrátí relativní cestu. */
@@ -184,8 +225,10 @@ export async function pickCoverFromGallery(): Promise<{ path: string; base64: st
   if (!photo.base64String) return null;
   const base64 = photo.base64String.replace(/\s+/g, "");
   const mime = sniffImageMime(base64) ?? "image/jpeg";
-  const path = await saveCover({ base64, mime });
-  return { path, base64, mime };
+  // Galerie může vrátit HEIC/AVIF – do knihy patří JPEG nebo PNG.
+  const data = await normalizeCover({ base64, mime });
+  const path = await saveCover(data);
+  return { path, base64: data.base64, mime: data.mime };
 }
 
 export function coverDataUri(base64: string, mime = "image/jpeg"): string {

@@ -46,9 +46,9 @@ workflows:
         XCODE_SCHEME: App
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_PROJECT: ios/App/App.xcodeproj
-        # 1.2.0 = logické kapitoly (alternativní verze), čištění reklam, WTR-LAB, oprava projektů.
+        # 1.2.1 = úplný katalog WTR-LAB (kontrola pokrytí), obálky AVIF.
         # Číslo buildu (CFBundleVersion) = Codemagic BUILD_NUMBER, roste s každým během.
-        APP_VERSION: 1.2.0
+        APP_VERSION: 1.2.1
 
     cache:
       cache_paths:
@@ -200,8 +200,8 @@ workflows:
             -destination "generic/platform=iOS" \
             -derivedDataPath build/derived \
             -allowProvisioningUpdates=NO \
-            MARKETING_VERSION="${APP_VERSION:-1.2.0}" \
-            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-5}" \
+            MARKETING_VERSION="${APP_VERSION:-1.2.1}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-6}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
