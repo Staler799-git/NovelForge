@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp } from "@capacitor/core";
+import { diag } from "./diag";
 
 export interface HttpResponse {
   url: string;
@@ -108,7 +109,32 @@ export class HttpClient {
     "Cache-Control": "no-cache",
   };
 
-  async get(url: string, opts: HttpOptions = {}): Promise<HttpResponse> {
+  /** Zapíše do diagnostiky začátek a konec požadavku (jen adresu bez parametrů a stav – žádné hlavičky ani těla). */
+  private async traced<T extends { status: number }>(method: string, url: string, run: () => Promise<T>, size: (r: T) => number): Promise<T> {
+    const end = diag.begin("http", { method, url });
+    try {
+      const res = await run();
+      end({ status: res.status, bytes: size(res) });
+      return res;
+    } catch (err) {
+      end({ status: 0, error: isAbort(err) ? "přerušeno" : ((err as Error)?.message ?? "chyba") });
+      throw err;
+    }
+  }
+
+  get(url: string, opts: HttpOptions = {}): Promise<HttpResponse> {
+    return this.traced("GET", url, () => this.doGet(url, opts), (r) => r.data.length);
+  }
+
+  postJson(url: string, body: unknown, opts: HttpOptions = {}): Promise<HttpResponse> {
+    return this.traced("POST", url, () => this.doPostJson(url, body, opts), (r) => r.data.length);
+  }
+
+  getBinary(url: string, opts: HttpOptions = {}): Promise<BinaryResponse> {
+    return this.traced("GET-BIN", url, () => this.doGetBinary(url, opts), (r) => Math.floor(r.base64.length * 0.75));
+  }
+
+  private async doGet(url: string, opts: HttpOptions = {}): Promise<HttpResponse> {
     const headers = { ...this.baseHeaders, ...(opts.headers ?? {}) };
     const timeout = opts.timeoutMs ?? 30000;
     if (opts.signal?.aborted) throw new AbortedError();
@@ -160,7 +186,7 @@ export class HttpClient {
   }
 
   /** Odešle JSON metodou POST. Stejně jako `get` nevyhazuje chybu kvůli stavovému kódu. */
-  async postJson(url: string, body: unknown, opts: HttpOptions = {}): Promise<HttpResponse> {
+  private async doPostJson(url: string, body: unknown, opts: HttpOptions = {}): Promise<HttpResponse> {
     const headers = { ...this.baseHeaders, Accept: "application/json", "Content-Type": "application/json", ...(opts.headers ?? {}) };
     const timeout = opts.timeoutMs ?? 30000;
     if (opts.signal?.aborted) throw new AbortedError();
@@ -211,7 +237,7 @@ export class HttpClient {
    * Na iOS vrací CapacitorHttp pro responseType "blob" přímo base64 řetězec –
    * žádný převod přes text, který by binární data poškodil.
    */
-  async getBinary(url: string, opts: HttpOptions = {}): Promise<BinaryResponse> {
+  private async doGetBinary(url: string, opts: HttpOptions = {}): Promise<BinaryResponse> {
     const headers = {
       ...this.baseHeaders,
       // JPEG/PNG mají přednost (jsou to základní formáty EPUB); AVIF a WebP se přijmou a převedou.

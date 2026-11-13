@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { diag } from "@/services/diag";
 import { BrowserRouter, Routes, Route, useNavigate } from "react-router-dom";
 import { SplashScreen } from "@capacitor/splash-screen";
 import { StatusBar, Style } from "@capacitor/status-bar";
@@ -34,6 +35,8 @@ export default function App() {
         }
       };
       await step("storage", () => storage.init());
+      // Diagnostika: vyhodnotí, zda minulé spuštění neskončilo nečekaně, a zahájí nový záznam.
+      await step("diagnostics", async () => { await diag.startSession(); });
       await step("db", () => db.init());
       // Stahování přerušená ukončením aplikace se nabídnou k pokračování.
       await step("recover", () => downloadManager.recoverInterrupted());
@@ -61,7 +64,9 @@ export default function App() {
   useEffect(() => {
     let listener: any;
     (async () => {
-      listener = await CapApp.addListener("appStateChange", () => {
+      listener = await CapApp.addListener("appStateChange", (state) => {
+        // iOS smí aplikaci na pozadí ukončit – v logu se to odliší od pádu.
+        diag.log(state?.isActive ? "app-foreground" : "app-background");
         store.refresh();
       });
     })();

@@ -1,6 +1,8 @@
 import { storage } from "./storage";
 import { db } from "./db";
-import { parseChapter } from "./parser/registry";
+import { parseChapter, parserInfo } from "./parser/registry";
+import { diag } from "./diag";
+import { onMemoryWarning } from "./render";
 import { normalizeLanguage } from "./parser/base";
 import { assertChapterContent, contentHash, escapeXml, sanitizeToXhtml } from "./content";
 import { stripBoilerplateXhtml } from "./clean";
@@ -37,6 +39,33 @@ export interface CurrentChapter {
 
 /** Kolik kapitol po sobě smí selhat, než se stahování zastaví s chybou. */
 const MAX_CONSECUTIVE_FAILURES = 5;
+/** Kolik upozornění systému na nedostatek paměti během okna vede k pozastavení. */
+const MEMORY_WARNINGS_TO_PAUSE = 2;
+const MEMORY_WINDOW_MS = 120_000;
+/** Pauza po upozornění na paměť, než se pokračuje další kapitolou. */
+const MEMORY_COOLDOWN_MS = 8000;
+/** Nejkratší odstup zápisů průběhu projektu do databáze (kapitoly se ukládají vždy hned). */
+const PROGRESS_SAVE_INTERVAL_MS = 2000;
+
+/** Nejvyšší souběžnost, kterou smí stahování dané adresy použít. */
+export function effectiveConcurrency(requested: number | undefined, url: string): number {
+  const wanted = Math.max(1, Math.floor(requested ?? 1));
+  let limit = Number.POSITIVE_INFINITY;
+  try {
+    limit = parserInfo(url).maxConcurrency;
+  } catch {
+    /* neznámá adresa – bez omezení parseru */
+  }
+  return Math.max(1, Math.min(wanted, limit, 4));
+}
+
+function safeHost(url: string | undefined): string {
+  try {
+    return new URL(url ?? "").hostname;
+  } catch {
+    return "";
+  }
+}
 
 function errorMessage(err: unknown): string {
   const msg = (err as any)?.message ?? String(err);
@@ -49,6 +78,22 @@ export class DownloadManager {
   private runningProjects = new Set<string>();
   private current = new Map<string, CurrentChapter>();
   private lastErrors = new Map<string, string>();
+  /** Časy upozornění systému na nedostatek paměti. */
+  private memoryWarnings: number[] = [];
+  private memoryListener: (() => void) | null = null;
+
+  /** Systém ohlásil nedostatek paměti (volá nativní modul; testy přímo). */
+  notifyMemoryWarning(): void {
+    const now = Date.now();
+    this.memoryWarnings = this.memoryWarnings.filter((t) => now - t < MEMORY_WINDOW_MS);
+    this.memoryWarnings.push(now);
+    diag.log("memory-warning", { count: this.memoryWarnings.length, running: this.runningProjects.size });
+  }
+
+  private recentMemoryWarnings(): number {
+    const now = Date.now();
+    return this.memoryWarnings.filter((t) => now - t < MEMORY_WINDOW_MS).length;
+  }
 
   on(event: (e: DownloadEvent) => void): () => void {
     this.listeners.add(event);
@@ -90,11 +135,22 @@ export class DownloadManager {
     this.active.set(project.id, controller);
     this.runningProjects.add(project.id);
     this.lastErrors.delete(project.id);
+    this.memoryWarnings = [];
+    if (!this.memoryListener) {
+      try {
+        this.memoryListener = onMemoryWarning(() => this.notifyMemoryWarning());
+      } catch {
+        this.memoryListener = () => {};
+      }
+    }
+    const endRun = diag.begin("run", { project: project.id, source: safeHost(project.sourceUrl) });
 
     try {
       await this.runLoop(project, controller.signal);
+      endRun({ ok: true });
     } catch (err) {
       const msg = `Stahování selhalo: ${errorMessage(err)}`;
+      endRun({ ok: false, error: errorMessage(err) });
       this.lastErrors.set(project.id, msg);
       try {
         await db.updateProject(project.id, { status: "paused" });
@@ -140,7 +196,20 @@ export class DownloadManager {
     const projects = await db.getProjects();
     for (const p of projects) {
       if (p.status === "downloading" && !this.runningProjects.has(p.id)) {
-        await db.updateProject(p.id, { status: "paused" });
+        // Počty se berou z uložených kapitol – průběh projektu se zapisuje s odstupem
+        // a při nečekaném ukončení mohl o kapitolu zaostat.
+        const patch: Partial<Project> = { status: "paused" };
+        try {
+          const stats = await db.getChapterStats(p.id);
+          if (stats.total > 0) {
+            patch.downloadedChapters = stats.downloaded;
+            patch.progress = Math.floor((stats.downloaded / stats.total) * 100);
+          }
+        } catch {
+          /* počty zůstanou, stav se přesto opraví */
+        }
+        await db.updateProject(p.id, patch);
+        diag.log("recovered-interrupted", { project: p.id, downloaded: patch.downloadedChapters });
       }
     }
   }
@@ -151,8 +220,9 @@ export class DownloadManager {
 
     // Čerstvá metadata (jazyk a název mohl uživatel mezitím upravit).
     const project = (await db.getProject(initial.id)) ?? initial;
+    const requested = Math.max(1, project.settings?.concurrentRequests ?? 3);
     const opts: DownloadOptions = {
-      concurrentRequests: Math.max(1, project.settings?.concurrentRequests ?? 3),
+      concurrentRequests: requested,
       delayMs: Math.max(0, project.settings?.delayMs ?? 1500),
       maxRetries: Math.max(0, project.settings?.maxRetries ?? 5),
     };
@@ -177,20 +247,42 @@ export class DownloadManager {
       }
     }
 
+    // Souběžnost omezuje parser (WTR-LAB: 1). Rozhoduje adresa kapitol, ne jen nastavení projektu.
+    const firstUrl = chapters.find((c) => c.status === "pending")?.url ?? chapters[0]?.url ?? project.sourceUrl ?? "";
+    opts.concurrentRequests = effectiveConcurrency(requested, firstUrl);
+    let parserName = "generic";
+    try {
+      parserName = parserInfo(firstUrl).name;
+    } catch {
+      /* neznámá adresa */
+    }
+
     const total = chapters.length;
     let downloaded = chapters.filter((c) => c.status === "downloaded").length;
     let failed = 0;
     const queue = chapters.filter((c) => c.status === "pending");
 
     const pct = () => (total === 0 ? 0 : Math.floor((downloaded / total) * 100));
+    let lastSave = 0;
+    let pendingExtra: Partial<Project> = {};
+    // Průběh projektu se do databáze zapisuje nejvýše jednou za PROGRESS_SAVE_INTERVAL_MS;
+    // změna stavu se zapíše vždy hned. Jednotlivé kapitoly se ukládají okamžitě jinde,
+    // takže po pádu se nic neztratí – počty se při dalším spuštění přepočítají z kapitol.
     const saveProgress = async (extra: Partial<Project> = {}) => {
-      await db.updateProject(project.id, {
-        totalChapters: total,
-        downloadedChapters: downloaded,
-        failedChapters: failed,
-        progress: pct(),
-        ...extra,
-      });
+      pendingExtra = { ...pendingExtra, ...extra };
+      const now = Date.now();
+      if (extra.status !== undefined || now - lastSave >= PROGRESS_SAVE_INTERVAL_MS) {
+        lastSave = now;
+        const data = pendingExtra;
+        pendingExtra = {};
+        await db.updateProject(project.id, {
+          totalChapters: total,
+          downloadedChapters: downloaded,
+          failedChapters: failed,
+          progress: pct(),
+          ...data,
+        });
+      }
       this.emit({ type: "progress", projectId: project.id, progress: pct(), downloaded, failed, total });
     };
 
@@ -208,6 +300,10 @@ export class DownloadManager {
     await saveProgress({ status: "downloading" });
     this.emit({ type: "project-start", projectId: project.id });
     this.emit({ type: "log", projectId: project.id, message: `Stahuji ${queue.length} kapitol (${downloaded} už hotovo).` });
+    if (opts.concurrentRequests < requested) {
+      this.emit({ type: "log", projectId: project.id, message: `Tento web se stahuje po ${opts.concurrentRequests === 1 ? "jedné kapitole" : `${opts.concurrentRequests} kapitolách`} (nastaveno ${requested}) – kvůli stabilitě.` });
+    }
+    diag.log("queue", { project: project.id, parser: parserName, total, downloaded, pending: queue.length, concurrency: opts.concurrentRequests, requested, delayMs: opts.delayMs });
 
     let consecutiveFailures = 0;
     let successesThisRun = 0;
@@ -254,6 +350,7 @@ export class DownloadManager {
 
       let result: DownloadResult = { chapterId: ch.id, success: false, error: "Nespuštěno" };
       let attempts = 0;
+      const endChapter = diag.begin("chapter", { project: project.id, parser: parserName, no: ch.url.match(/chapter[-_/](\d+)/i)?.[1] ?? String(ch.orderIndex + 1), index, url: ch.url });
       // Dokud v tomto běhu nic neprošlo, zkoušíme každou kapitolu jen krátce –
       // když web blokuje vše, dozví se to uživatel za pár sekund, ne za minuty.
       const maxRetries = () => (successesThisRun === 0 ? Math.min(1, opts.maxRetries) : opts.maxRetries);
@@ -264,7 +361,18 @@ export class DownloadManager {
         try {
           result = await downloadOne(ch);
         } catch (err: any) {
-          if (isAbort(err) || runSignal.aborted) return; // pozastaveno – kapitola zůstává ve frontě
+          if (isAbort(err) || runSignal.aborted) {
+            endChapter({ ok: false, error: "pozastaveno" });
+            return; // pozastaveno – kapitola zůstává ve frontě
+          }
+          if (err?.critical === true) {
+            // Kritická chyba (pád vykreslovacího procesu, nedostatek paměti): nepokračovat.
+            // Kapitola zůstává ve frontě; stažené kapitoly se nemění.
+            endChapter({ ok: false, critical: true, error: errorMessage(err) });
+            if (!fatal) fatal = `Stahování pozastaveno kvůli kritické chybě: ${errorMessage(err)}. Stažené kapitoly zůstaly uložené; pokračujte tlačítkem Pokračovat.`;
+            stop();
+            return;
+          }
           retryable = err?.retryable !== false;
           result = { chapterId: ch.id, success: false, error: errorMessage(err) };
         }
@@ -272,8 +380,12 @@ export class DownloadManager {
         await db.updateChapter(ch.id, { retryCount: attempts, errorMessage: result.error });
         this.emit({ type: "log", projectId: project.id, message: `${ch.title}: ${result.error} – opakuji (${attempts}/${maxRetries()})` });
         await sleep(Math.min(10000, Math.max(500, opts.delayMs) * attempts), runSignal);
-        if (runSignal.aborted) return;
+        if (runSignal.aborted) {
+          endChapter({ ok: false, error: "pozastaveno" });
+          return;
+        }
       }
+      endChapter({ ok: result.success, attempts, bytes: result.bytes, error: result.success ? undefined : result.error });
 
       if (result.success) {
         downloaded++;
@@ -301,10 +413,33 @@ export class DownloadManager {
         (async () => {
           // rozfázování startu, aby požadavky nepřišly ve stejný okamžik
           if (w > 0 && opts.delayMs > 0) await sleep((opts.delayMs / opts.concurrentRequests) * w, runSignal);
+          let seenWarnings = this.recentMemoryWarnings();
           while (!runSignal.aborted) {
+            // Kontrola paměti před každou kapitolou.
+            const warnings = this.recentMemoryWarnings();
+            if (warnings >= MEMORY_WARNINGS_TO_PAUSE) {
+              if (!fatal) fatal = "Stahování pozastaveno: systém opakovaně hlásí nedostatek paměti. Stažené kapitoly zůstaly uložené; zavřete jiné aplikace a pokračujte tlačítkem Pokračovat.";
+              stop();
+              break;
+            }
+            if (warnings > seenWarnings) {
+              this.emit({ type: "log", projectId: project.id, message: "Systém hlásí nedostatek paměti – krátká pauza před další kapitolou." });
+              await sleep(MEMORY_COOLDOWN_MS, runSignal);
+              if (runSignal.aborted) break;
+            }
+            seenWarnings = warnings;
             const index = next++;
             if (index >= queue.length) break;
-            await processOne(queue[index], index);
+            try {
+              await processOne(queue[index], index);
+            } catch (err) {
+              // Chyba mimo stažení kapitoly (databáze, úložiště): ostatní pracovníci se zastaví
+              // a běh skončí řízeně pozastavením – žádná neobsloužená výjimka.
+              diag.log("worker-error", { project: project.id, error: errorMessage(err) });
+              if (!fatal) fatal = `Stahování pozastaveno: ${errorMessage(err)}`;
+              stop();
+              break;
+            }
             if (opts.delayMs > 0) await sleep(opts.delayMs, runSignal);
           }
         })(),
@@ -319,6 +454,7 @@ export class DownloadManager {
 
     if (fatal) {
       this.lastErrors.set(project.id, fatal);
+      diag.log("run-paused", { project: project.id, reason: fatal, downloaded, total });
       await saveProgress({ status: "paused" });
       this.emit({ type: "log", projectId: project.id, message: fatal });
       this.emit({ type: "project-end", projectId: project.id, ok: false, error: fatal });

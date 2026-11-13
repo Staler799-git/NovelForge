@@ -200,7 +200,7 @@ export function findChapterList(data: unknown): ListedChapter[] {
 }
 
 /** Najde text kapitoly v datech stránky: pole odstavců nebo dlouhý řetězec pod klíčem těla. */
-export function findChapterBody(data: unknown): { title: string; paragraphs: string[] } | null {
+export function findChapterBody(data: unknown): { title: string; paragraphs: string[]; node: Record<string, unknown>; parent: Record<string, unknown> | null } | null {
   const BODY_KEYS = ["body", "content", "text", "paragraphs"];
   let best: { title: string; paragraphs: string[]; len: number; node: Obj } | null = null;
   for (const node of walk(data)) {
@@ -216,14 +216,16 @@ export function findChapterBody(data: unknown): { title: string; paragraphs: str
     }
   }
   // Název může být o úroveň výš ({ title, data: { body } }).
-  if (best && !best.title) {
+  let parent: Obj | null = null;
+  if (best) {
     for (const node of walk(data)) {
       if (!isObj(node) || !Object.values(node).includes(best.node)) continue;
-      best.title = str(node.title) || str(node.name);
+      parent = node;
+      if (!best.title) best.title = str(node.title) || str(node.name);
       break;
     }
   }
-  return best ? { title: best.title, paragraphs: best.paragraphs } : null;
+  return best ? { title: best.title, paragraphs: best.paragraphs, node: best.node, parent } : null;
 }
 
 function stripSiteSuffix(title: string): string {
@@ -292,7 +294,33 @@ function rangesOf(numbers: number[]): Array<[number, number]> {
   return out;
 }
 
+/**
+ * Ověří, že data patří k požadované novele a kapitole. Kontrolují se jen pole,
+ * která web skutečně vrátil (raw_id = číslo novely z adresy, order/chapter_no =
+ * číslo kapitoly); chybějící pole nejsou chyba. Vrací popis neshody, nebo null.
+ */
+export function identityMismatch(node: unknown, t: Pick<WtrUrl, "id" | "chapter">): string | null {
+  if (!isObj(node)) return null;
+  const raw = num(node.raw_id);
+  if (raw !== null && raw !== Number(t.id)) return `odpověď patří jiné novele (číslo ${raw}, čekám ${t.id})`;
+  if (t.chapter !== null) {
+    for (const k of ["chapter_no", "order"]) {
+      const n = num(node[k]);
+      if (n !== null && n !== t.chapter) return `odpověď patří jiné kapitole (číslo ${n}, čekám ${t.chapter})`;
+    }
+  }
+  return null;
+}
+
+/** Chyba „cizí obsah“: nikdy se neopakuje a kapitola se neuloží. */
+function wrongContent(reason: string): ContentError {
+  return new ContentError(`WTR-LAB vrátil obsah, který nepatří k této kapitole – ${reason}. Kapitola se neuložila.`, false);
+}
+
 export class WtrLabParser extends NovelParser {
+  override readonly name: string = "wtrlab";
+  /** Dokud není bezpečná souběžnost ověřená na zařízení, jede WTR-LAB vždy po jedné kapitole. */
+  override readonly maxConcurrency: number = 1;
   canHandle(url: string): boolean {
     try {
       return /(^|\.)wtr-lab\.com$/i.test(new URL(url).hostname);
@@ -321,13 +349,22 @@ export class WtrLabParser extends NovelParser {
     }
     if (html && usable(html)) return html;
     try {
-      const { renderHtml } = await import("@/services/render");
-      const rendered = await renderHtml(url, { delayMs: renderDelayMs });
+      const { renderPage } = await import("@/services/render");
+      const page = await renderPage(url, { delayMs: renderDelayMs });
       if (opts?.signal?.aborted) throw new DOMException("Přerušeno", "AbortError");
+      // Web mohl přesměrovat jinam (úvodní stránka, jiná novela, jiná kapitola).
+      const want = parseWtrUrl(url);
+      const got = page.url ? parseWtrUrl(page.url) : null;
+      if (page.url && want && (!got || got.id !== want.id || (want.chapter !== null && got.chapter !== want.chapter))) {
+        throw wrongContent("stránka byla přesměrována na jinou adresu");
+      }
+      const rendered = page.html;
       if (rendered && usable(rendered)) return rendered;
       if (rendered && !html) html = rendered;
     } catch (err) {
       if (isAbort(err)) throw err;
+      // Cizí obsah a kritická chyba vykreslení (pád procesu, paměť) se nesmí zamlčet.
+      if (err instanceof ContentError || (err as { critical?: boolean })?.critical === true) throw err;
       // WKWebView není k dispozici (prohlížeč, testy) nebo vykreslení selhalo.
     }
     if (!html && firstError) throw firstError;
@@ -617,6 +654,9 @@ export class WtrLabParser extends NovelParser {
         reasons.push(`${mode}: odpověď neobsahuje text`);
         continue;
       }
+      // Nikdy neuložit kapitolu jiné knihy: odpověď musí odpovídat tomu, co bylo vyžádáno.
+      const mismatch = identityMismatch(json.chapter, t) ?? identityMismatch(json.data, t) ?? identityMismatch(content, t);
+      if (mismatch) throw wrongContent(mismatch);
       if (!Array.isArray(content.body) || !content.body.every((x) => typeof x === "string")) {
         reasons.push(`${mode}: text je v podobě, kterou aplikace nečte (chráněný obsah)`);
         continue;
@@ -651,9 +691,13 @@ export class WtrLabParser extends NovelParser {
   }
 
   /** Text kapitoly z HTML (data stránky, nebo vykreslený DOM). Vrací null, když v něm není. */
-  private readChapter(html: string): { title: string; html: string } | null {
+  private readChapter(html: string, t?: WtrUrl): { title: string; html: string } | null {
     const data = extractNextData(html);
     const body = data ? findChapterBody(data) : null;
+    if (body && t) {
+      const mismatch = identityMismatch(body.node, t) ?? identityMismatch(body.parent, t);
+      if (mismatch) throw wrongContent(mismatch);
+    }
     const doc = this.parseHtml(html);
     const heading = cleanText(doc.querySelector(".chapter-title, h1, h2")?.textContent ?? "");
     if (body) {
@@ -698,8 +742,8 @@ export class WtrLabParser extends NovelParser {
     const api = await this.readerApi(t, url, opts);
     let ch = api.chapter;
     if (!ch) {
-      const html = await this.load(url, (h) => !!this.readChapter(h), opts, this.renderDelayMs);
-      ch = this.readChapter(html);
+      const html = await this.load(url, (h) => !!this.readChapter(h, t), opts, this.renderDelayMs);
+      ch = this.readChapter(html, t);
     }
     if (!ch) {
       throw new ContentError(

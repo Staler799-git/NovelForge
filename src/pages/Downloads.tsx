@@ -27,13 +27,32 @@ export function Downloads() {
     let mounted = true;
     load();
     const unsub = projectStore.subscribe(load);
+    // Průběh přichází po každé kapitole; seznam se z databáze načítá nejvýše jednou za 1,5 s.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let lastLoad = 0;
+    const loadThrottled = () => {
+      const wait = 1500 - (Date.now() - lastLoad);
+      if (wait <= 0) {
+        lastLoad = Date.now();
+        load();
+      } else if (!timer) {
+        timer = setTimeout(() => {
+          timer = null;
+          if (!mounted) return;
+          lastLoad = Date.now();
+          load();
+        }, wait);
+      }
+    };
     const sub = downloadManager.on((e) => {
       if (!mounted) return;
       if (e.type === "log") setLogs((prev) => [e.message, ...prev.slice(0, 29)]);
-      if (e.type === "project-end" || e.type === "project-start" || e.type === "progress") load();
+      if (e.type === "project-end" || e.type === "project-start") { lastLoad = Date.now(); load(); }
+      else if (e.type === "progress") loadThrottled();
     });
     return () => {
       mounted = false;
+      if (timer) clearTimeout(timer);
       unsub();
       sub();
     };

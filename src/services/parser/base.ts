@@ -44,6 +44,13 @@ export function httpStatusMessage(status: number): string {
 }
 
 export abstract class NovelParser {
+  /** Název parseru pro diagnostiku. */
+  readonly name: string = "generic";
+  /**
+   * Nejvyšší počet souběžně stahovaných kapitol, který parser snese.
+   * Správce stahování ho nepřekročí bez ohledu na nastavení projektu.
+   */
+  readonly maxConcurrency: number = Number.POSITIVE_INFINITY;
   abstract canHandle(url: string): boolean;
   abstract fetchMetadata(url: string, opts?: FetchOptions): Promise<NovelMetadata>;
   abstract fetchChapterList(url: string, opts?: FetchOptions): Promise<ParserChapter[]>;
