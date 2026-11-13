@@ -28,7 +28,11 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
     public let jsName = "WebRenderer"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "render", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "cancelPendingRender", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "cancelPendingRender", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "openAuthPage", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "beginBackgroundWork", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "endBackgroundWork", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "deviceState", returnType: CAPPluginReturnPromise)
     ]
 
     private struct Job {
@@ -37,7 +41,7 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
         let delayMs: Int
     }
 
-    private static let userAgent =
+    fileprivate static let userAgent =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
     /// Nejvíc čekajících požadavků; další se odmítnou, aby fronta nerostla bez omezení.
     private static let maxQueued = 8
@@ -51,6 +55,7 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
     private var timeoutWorkItem: DispatchWorkItem?
     private var generation = 0
     private var sawBrowserCheck = false
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     override public func load() {
         NotificationCenter.default.addObserver(
@@ -110,6 +115,117 @@ public class WebRenderer: CAPPlugin, CAPBridgedPlugin {
             }
             self.finish(html: nil, message: "Render cancelled")
             call.resolve()
+        }
+    }
+
+    // MARK: - Přihlášení / bezpečnostní ověření (provádí uživatel sám)
+
+    /// Otevře stránku v okně uvnitř aplikace. Uživatel se v něm sám přihlásí nebo provede
+    /// bezpečnostní ověření; nic se nevyplňuje ani neřeší automaticky. Po zavření se cookies
+    /// daného webu předají síťové vrstvě aplikace (HTTPCookieStorage) – stejný postup, jaký
+    /// používá sám Capacitor. Cookies se nikam jinam neukládají ani nevypisují.
+    @objc public func openAuthPage(_ call: CAPPluginCall) {
+        guard let urlString = call.getString("url"), let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(), scheme == "https",
+              let host = url.host?.lowercased(), !host.isEmpty else {
+            call.reject("Invalid URL")
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let presenter = self.bridge?.viewController else {
+                call.reject("Window is not available")
+                return
+            }
+            if presenter.presentedViewController != nil {
+                call.reject("Another window is already open")
+                return
+            }
+            let browser = AuthBrowserViewController(url: url, userAgent: WebRenderer.userAgent) {
+                WebRenderer.syncCookies(forHost: host) { count in
+                    call.resolve(["synced": count])
+                }
+            }
+            let navigation = UINavigationController(rootViewController: browser)
+            navigation.modalPresentationStyle = .fullScreen
+            presenter.present(navigation, animated: true, completion: nil)
+        }
+    }
+
+    /// Zkopíruje cookies webu z úložiště WKWebView do HTTPCookieStorage.shared.
+    private static func syncCookies(forHost host: String, completion: @escaping (Int) -> Void) {
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            var count = 0
+            for cookie in cookies {
+                var domain = cookie.domain.lowercased()
+                if domain.hasPrefix(".") {
+                    domain.removeFirst()
+                }
+                if domain.isEmpty {
+                    continue
+                }
+                if domain == host || host.hasSuffix("." + domain) || domain.hasSuffix("." + host) {
+                    HTTPCookieStorage.shared.setCookie(cookie)
+                    count += 1
+                }
+            }
+            DispatchQueue.main.async {
+                completion(count)
+            }
+        }
+    }
+
+    // MARK: - Krátký běh na pozadí a stav zařízení
+
+    /// Požádá systém o krátký čas na pozadí (typicky kolem 30 s) na dokončení rozpracované
+    /// kapitoly. Není to trvalý běh na pozadí – po vypršení iOS aplikaci pozastaví.
+    @objc public func beginBackgroundWork(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                call.resolve(["granted": false])
+                return
+            }
+            if self.backgroundTask == .invalid {
+                self.backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "NovelForgeDownload") { [weak self] in
+                    self?.notifyListeners("backgroundExpiring", data: [:])
+                    self?.finishBackgroundTask()
+                }
+            }
+            var result: [String: Any] = ["granted": self.backgroundTask != .invalid]
+            let remaining = UIApplication.shared.backgroundTimeRemaining
+            if remaining.isFinite && remaining < 100_000 {
+                result["remaining"] = remaining
+            }
+            call.resolve(result)
+        }
+    }
+
+    @objc public func endBackgroundWork(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { [weak self] in
+            self?.finishBackgroundTask()
+            call.resolve()
+        }
+    }
+
+    private func finishBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        let task = backgroundTask
+        backgroundTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
+    }
+
+    /// Nabíjení a úsporný režim (pro volbu „stahovat jen při nabíjení“).
+    @objc public func deviceState(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            let device = UIDevice.current
+            if !device.isBatteryMonitoringEnabled {
+                device.isBatteryMonitoringEnabled = true
+            }
+            var result: [String: Any] = ["lowPower": ProcessInfo.processInfo.isLowPowerModeEnabled]
+            let state = device.batteryState
+            if state != .unknown {
+                result["charging"] = (state == .charging || state == .full)
+            }
+            call.resolve(result)
         }
     }
 
@@ -223,5 +339,67 @@ extension WebRenderer: WKNavigationDelegate {
     public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard renderWebView === webView else { return }
         finish(html: nil, message: "Web content process terminated (possibly out of memory)")
+    }
+}
+
+/// Okno, ve kterém se uživatel sám přihlásí nebo provede bezpečnostní ověření webu.
+/// Používá stejné úložiště cookies jako vykreslování stránek.
+final class AuthBrowserViewController: UIViewController, WKUIDelegate {
+    private let startUrl: URL
+    private let userAgent: String
+    private let onClose: () -> Void
+    private var webView: WKWebView?
+    private var closed = false
+
+    init(url: URL, userAgent: String, onClose: @escaping () -> Void) {
+        self.startUrl = url
+        self.userAgent = userAgent
+        self.onClose = onClose
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        title = startUrl.host
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Hotovo", style: .done, target: self, action: #selector(closeTapped))
+        navigationItem.leftBarButtonItem = UIBarButtonItem(barButtonSystemItem: .refresh, target: self, action: #selector(reloadTapped))
+
+        let web = WKWebView(frame: view.bounds, configuration: WKWebViewConfiguration())
+        web.customUserAgent = userAgent
+        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        web.allowsBackForwardNavigationGestures = true
+        web.uiDelegate = self
+        view.addSubview(web)
+        webView = web
+        web.load(URLRequest(url: startUrl))
+    }
+
+    /// Odkazy otevírané do nového okna (např. přihlášení přes jinou službu) se načtou ve stejném okně.
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+        }
+        return nil
+    }
+
+    @objc private func reloadTapped() {
+        webView?.reload()
+    }
+
+    @objc private func closeTapped() {
+        guard !closed else { return }
+        closed = true
+        webView?.stopLoading()
+        let callback = onClose
+        let host: UIViewController = navigationController ?? self
+        host.dismiss(animated: true) {
+            callback()
+        }
     }
 }

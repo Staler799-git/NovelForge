@@ -1,4 +1,5 @@
 import { parseHtml } from "../html";
+import { classifyHttp } from "@/services/access";
 import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
 import { http, HttpError, isAbort } from "@/services/http";
 
@@ -43,6 +44,19 @@ export function httpStatusMessage(status: number): string {
   return `Neočekávaná odpověď serveru (HTTP ${status})`;
 }
 
+export interface TranslationModeInfo {
+  id: string;
+  label: string;
+}
+export type SessionState = "signed-in" | "signed-out" | "unknown";
+/** Výsledek ověření jednoho překladu: "available", druh překážky (viz access.ts) nebo "unknown". */
+export interface ModeProbe {
+  mode: string;
+  label: string;
+  state: string;
+  message: string;
+}
+
 export abstract class NovelParser {
   /** Název parseru pro diagnostiku. */
   readonly name: string = "generic";
@@ -51,10 +65,33 @@ export abstract class NovelParser {
    * Správce stahování ho nepřekročí bez ohledu na nastavení projektu.
    */
   readonly maxConcurrency: number = Number.POSITIVE_INFINITY;
+  /** Smí se u tohoto webu použít rychlý režim stahování? */
+  readonly allowFast: boolean = true;
+  /** Nejkratší odstup mezi kapitolami, který web snese (ms). */
+  get minIntervalMs(): number {
+    return 0;
+  }
+  /** Překlad, kterým starší verze aplikace stahovaly (pro projekty bez evidovaného překladu). */
+  readonly legacyTranslationMode: string | undefined = undefined;
+
+  /** Překladové varianty, které zdroj nabízí (prázdné = zdroj má jediný text). */
+  translationModes(): TranslationModeInfo[] {
+    return [];
+  }
+
+  /** Ověří dostupnost jednotlivých překladů pro danou kapitolu. */
+  async probeTranslationModes(_chapterUrl: string, _opts?: FetchOptions): Promise<ModeProbe[]> {
+    return [];
+  }
+
+  /** Stav přihlášení na zdroji, pokud ho lze bezpečně zjistit. */
+  async checkSession(_url: string, _opts?: FetchOptions & { fresh?: boolean }): Promise<SessionState> {
+    return "unknown";
+  }
   abstract canHandle(url: string): boolean;
   abstract fetchMetadata(url: string, opts?: FetchOptions): Promise<NovelMetadata>;
   abstract fetchChapterList(url: string, opts?: FetchOptions): Promise<ParserChapter[]>;
-  abstract fetchChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string }>;
+  abstract fetchChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string; translationMode?: string }>;
 
   /**
    * Načte celý katalog kapitol včetně informací o úplnosti.
@@ -117,12 +154,18 @@ export abstract class NovelParser {
     }
 
     if (problem) {
+      // Druh překážky (rate limit, ověření, 403…) pro správce stahování.
+      const access = classifyHttp(res.status, res.headers, res.data, "Web");
       if (!res.ok && !detectBlockPage(res.data ?? "", len)) {
         const e = new HttpError(problem, res.status, url);
         (e as any).retryable = retryable;
+        if (access) Object.assign(e, { kind: access.kind, retryAfterMs: access.retryAfterMs, stopSource: access.stopSource });
         throw e;
       }
-      throw new ContentError(problem, retryable);
+      const e = new ContentError(problem, retryable);
+      const kind = access?.kind ?? (/CAPTCHA|ověření prohlížeče/.test(problem) ? "challenge" : /rate limit/.test(problem) ? "rate-limited" : /odmítl přístup/.test(problem) ? "forbidden" : undefined);
+      if (kind) Object.assign(e, { kind, retryAfterMs: access?.retryAfterMs, stopSource: kind === "challenge" });
+      throw e;
     }
     return html;
   }

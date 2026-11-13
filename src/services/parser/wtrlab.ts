@@ -23,9 +23,11 @@
  * Přihlášení, CAPTCHA/Turnstile, zamčené kapitoly ani šifrovaný obsah se neobcházejí.
  */
 import { NovelParser, ContentError, cleanText, findCoverUrl, normalizeLanguage, absoluteUrl } from "./base";
+import type { TranslationModeInfo, ModeProbe, SessionState } from "./base";
+import { AccessError, accessKindOf, classifyHttp, headerOf, looksLikeLoginMessage } from "@/services/access";
 import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
-import { cleanChapterElement, stripBoilerplateXhtml } from "@/services/clean";
-import { sanitizeToXhtml, assertChapterContent, escapeXml, htmlToText } from "@/services/content";
+import { stripBoilerplateXhtml } from "@/services/clean";
+import { assertChapterContent, escapeXml, htmlToText } from "@/services/content";
 import { http, isAbort } from "@/services/http";
 import { numberCoverage, formatRanges } from "@/services/catalog";
 
@@ -232,7 +234,29 @@ function stripSiteSuffix(title: string): string {
   return cleanText(title.replace(/\s*[-|–—·:]\s*wtr[-\s]?lab.*$/i, "").replace(/^wtr[-\s]?lab\s*[-|–—·:]\s*/i, ""));
 }
 
-const READER_MODES = ["ai", "web"];
+/** Překlady, které WTR-LAB nabízí; `id` je hodnota pole „translate“ v požadavku čtečky. */
+export const WTR_MODES: TranslationModeInfo[] = [
+  { id: "web", label: "Web" },
+  { id: "webplus", label: "Web+" },
+  { id: "ai", label: "AI" },
+];
+/** Překlad použitý, když projekt žádný zvolený nemá (starší verze stahovaly AI). */
+export const WTR_DEFAULT_MODE = "ai";
+
+export function normalizeWtrMode(mode: string | undefined | null): string | null {
+  const m = (mode ?? "").trim().toLowerCase().replace(/\+$/, "plus").replace(/[\s_-]/g, "");
+  return WTR_MODES.some((x) => x.id === m) ? m : null;
+}
+
+function modeLabel(mode: string): string {
+  return WTR_MODES.find((m) => m.id === mode)?.label ?? mode;
+}
+
+function parserError(reason: string): ContentError {
+  const e = new ContentError(`WTR-LAB: ${reason}.`, false);
+  (e as ContentError & { kind?: string }).kind = "parser";
+  return e;
+}
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function tryJson(text: string | null | undefined): unknown | null {
@@ -321,6 +345,12 @@ export class WtrLabParser extends NovelParser {
   override readonly name: string = "wtrlab";
   /** Dokud není bezpečná souběžnost ověřená na zařízení, jede WTR-LAB vždy po jedné kapitole. */
   override readonly maxConcurrency: number = 1;
+  /** Web hlídá „neobvyklou čtecí aktivitu“ – rychlý režim se tu nepovoluje. */
+  override readonly allowFast: boolean = false;
+  override readonly legacyTranslationMode: string = WTR_DEFAULT_MODE;
+  override get minIntervalMs(): number {
+    return this.chapterIntervalMs;
+  }
   canHandle(url: string): boolean {
     try {
       return /(^|\.)wtr-lab\.com$/i.test(new URL(url).hostname);
@@ -435,10 +465,7 @@ export class WtrLabParser extends NovelParser {
   catalogDelayMs = 400;
   /** Nejkratší odstup mezi požadavky na text kapitol (ms) – web omezuje rychlost. */
   chapterIntervalMs = 3000;
-  /** Prodleva po načtení stránky ve WKWebView, než se čte text dotahovaný skriptem. */
-  renderDelayMs = 4000;
   private lastChapterAt = 0;
-  private preferredMode: string | null = null;
 
   /**
    * Načte JSON z datového rozhraní webu – stejného, které používá stránka sama.
@@ -591,167 +618,201 @@ export class WtrLabParser extends NovelParser {
     return { chapters, pagesLoaded: Math.max(1, index.batches), declaredTotal: declared ?? undefined, complete: cov.complete, aborted: false, warnings };
   }
 
+  /** Stav přihlášení (krátce se pamatuje, aby se neptal při každé kapitole). */
+  private sessionCache: { at: number; state: SessionState } | null = null;
+
+  override translationModes(): TranslationModeInfo[] {
+    return WTR_MODES;
+  }
+
   /**
-   * Text kapitoly z rozhraní čtečky webu (/api/reader/get) – stejný požadavek,
-   * jaký posílá stránka kapitoly. Vrací null + důvod, když rozhraní text
-   * nevydá v čitelné podobě (ověření, šifrovaný obsah); pak se použije
-   * vykreslení stránky. Nic se nedešifruje a žádné ověření se neobchází.
+   * Zjistí, zda je uživatel na webu přihlášen (GET /api/auth/get-session –
+   * stejný dotaz, jaký posílá stránka). Nic se neukládá ani nevypisuje;
+   * vrací jen stav. „unknown“ = web neodpověděl čitelně.
    */
-  private async readerApi(t: WtrUrl, pageUrl: string, opts?: FetchOptions): Promise<{ chapter: { title: string; html: string } | null; reason: string }> {
-    const modes = this.preferredMode ? [this.preferredMode, ...READER_MODES.filter((m) => m !== this.preferredMode)] : READER_MODES;
-    const reasons: string[] = [];
-    for (const mode of modes) {
-      let res;
-      try {
-        res = await http.postJson(
-          `${t.origin}/api/reader/get`,
-          { translate: mode, language: t.lang, raw_id: Number(t.id), chapter_no: t.chapter, retry: false, force_retry: false },
-          { signal: opts?.signal, timeoutMs: 30000, headers: { Referer: pageUrl } },
-        );
-      } catch (err) {
-        if (isAbort(err)) throw err;
-        reasons.push(`${mode}: ${(err as Error)?.message ?? "chyba sítě"}`);
-        continue;
-      }
-      const json = tryJson(res.data);
-      if (!isObj(json)) {
-        reasons.push(`${mode}: HTTP ${res.status}, odpověď není JSON${/just a moment|challenge-platform/i.test(res.data ?? "") ? " (ověření prohlížeče)" : ""}`);
-        continue;
-      }
-      if (json.code === "CHAPTER_LOCKED" || (isObj(json.chapter) && json.chapter.locked === true)) {
-        reasons.push(`${mode}: kapitola je v tomto překladu zamčená`);
-        continue;
-      }
-      if (json.requireTurnstile || json.code === 1401) {
-        reasons.push(`${mode}: web vyžaduje ověření (Turnstile)`);
-        break; // ověření se týká celé čtečky, další režim nemá smysl zkoušet
-      }
-      if (!res.ok || json.success === false || json.error) {
-        reasons.push(`${mode}: HTTP ${res.status}${typeof json.error === "string" ? ` – ${json.error}` : ""}${typeof json.message === "string" ? ` – ${json.message}` : ""}`);
-        continue;
-      }
-      let content: unknown = isObj(json.data) ? json.data.data : undefined;
-      if (!(isObj(content) && content.body !== undefined) && typeof json.content_url === "string" && json.content_url) {
-        const target = absoluteUrl(t.origin, json.content_url);
-        let host = "";
-        try {
-          host = new URL(target).hostname;
-        } catch {
-          /* neplatná adresa */
-        }
-        if (!/(^|\.)wtr-lab\.com$/i.test(host)) {
-          reasons.push(`${mode}: obsah odkazuje mimo web`);
-          continue;
-        }
-        const { json: payload, reason } = await this.fetchJson(target, pageUrl, opts);
-        content = isObj(payload) && isObj(payload.data) ? payload.data.data : undefined;
-        if (!isObj(content)) {
-          reasons.push(`${mode}: obsah kapitoly se nepodařilo načíst (${reason || "neočekávaný formát"})`);
-          continue;
-        }
-      }
-      if (!isObj(content) || content.body === undefined) {
-        reasons.push(`${mode}: odpověď neobsahuje text`);
-        continue;
-      }
-      // Nikdy neuložit kapitolu jiné knihy: odpověď musí odpovídat tomu, co bylo vyžádáno.
-      const mismatch = identityMismatch(json.chapter, t) ?? identityMismatch(json.data, t) ?? identityMismatch(content, t);
-      if (mismatch) throw wrongContent(mismatch);
-      if (!Array.isArray(content.body) || !content.body.every((x) => typeof x === "string")) {
-        reasons.push(`${mode}: text je v podobě, kterou aplikace nečte (chráněný obsah)`);
-        continue;
-      }
-      const terms = isObj(content.glossary_data) && Array.isArray(content.glossary_data.terms) ? (content.glossary_data.terms as unknown[]) : [];
-      const patch = Array.isArray(content.patch) ? (content.patch as unknown[]) : [];
-      const fix = (text: string) => {
-        let out = text.replace(/※(\d+)[⛬〓]/g, (m, i) => {
-          const term = terms[Number(i)];
-          const value = Array.isArray(term) ? term[0] : undefined;
-          return typeof value === "string" && value ? value : m;
-        });
-        for (const p of patch) if (isObj(p) && typeof p.zh === "string" && p.zh && typeof p.en === "string") out = out.split(p.zh).join(` ${p.en}`);
-        return resolveTokens(out);
-      };
-      const paragraphs = (content.body as string[]).filter((x) => x.trim() && x.trim() !== "[image]").map(fix);
-      if (paragraphs.some((p) => /※\d+[⛬〓]/.test(p))) {
-        reasons.push(`${mode}: v textu zůstaly nevyplněné zástupné značky`);
-        continue;
-      }
-      const xhtml = paragraphs.flatMap((p) => p.split(/\n+/)).map((p) => p.trim()).filter(Boolean).map((p) => `<p>${escapeXml(p)}</p>`).join("\n");
-      const cleaned = stripBoilerplateXhtml(xhtml, { siteNames: SITE_NAMES }).html;
-      if (htmlToText(cleaned).length < 120) {
-        reasons.push(`${mode}: text je příliš krátký`);
-        continue;
-      }
-      this.preferredMode = mode;
-      const rawTitle = (isObj(json.chapter) && typeof json.chapter.title === "string" && json.chapter.title) || (typeof content.title === "string" ? content.title : "");
-      return { chapter: { title: fix(rawTitle), html: cleaned }, reason: "" };
-    }
-    return { chapter: null, reason: reasons.join("; ") };
-  }
-
-  /** Text kapitoly z HTML (data stránky, nebo vykreslený DOM). Vrací null, když v něm není. */
-  private readChapter(html: string, t?: WtrUrl): { title: string; html: string } | null {
-    const data = extractNextData(html);
-    const body = data ? findChapterBody(data) : null;
-    if (body && t) {
-      const mismatch = identityMismatch(body.node, t) ?? identityMismatch(body.parent, t);
-      if (mismatch) throw wrongContent(mismatch);
-    }
-    const doc = this.parseHtml(html);
-    const heading = cleanText(doc.querySelector(".chapter-title, h1, h2")?.textContent ?? "");
-    if (body) {
-      const xhtml = body.paragraphs.length === 1 && /<\w+[^>]*>/.test(body.paragraphs[0])
-        ? sanitizeToXhtml(body.paragraphs[0])
-        : body.paragraphs.flatMap((p) => p.split(/\n+/)).map((p) => p.trim()).filter(Boolean).map((p) => `<p>${escapeXml(p)}</p>`).join("\n");
-      const cleaned = stripBoilerplateXhtml(xhtml, { siteNames: SITE_NAMES }).html;
-      if (htmlToText(cleaned).length >= 120) return { title: body.title || heading, html: cleaned };
-    }
-    for (const sel of [".chapter-body", "[class*='chapter-body']", ".chapter-content", "[data-chapter-body]", "article", "main"]) {
-      let best: Element | null = null;
-      let bestLen = 0;
-      for (const el of Array.from(doc.querySelectorAll(sel))) {
-        const paragraphs = Array.from(el.querySelectorAll("p")).reduce((s, p) => s + cleanText(p.textContent ?? "").length, 0);
-        if (paragraphs > bestLen) {
-          best = el;
-          bestLen = paragraphs;
-        }
-      }
-      if (!best || bestLen < 120) continue;
-      const clone = best.cloneNode(true) as Element;
-      for (const el of Array.from(clone.querySelectorAll("h1, .chapter-title"))) el.remove();
-      cleanChapterElement(clone, { siteNames: SITE_NAMES });
-      const cleaned = stripBoilerplateXhtml(sanitizeToXhtml(clone.innerHTML), { siteNames: SITE_NAMES }).html;
-      if (htmlToText(cleaned).length >= 120) return { title: heading, html: cleaned };
-    }
-    return null;
-  }
-
-  async fetchChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string }> {
+  override async checkSession(url: string, opts?: FetchOptions & { fresh?: boolean }): Promise<SessionState> {
     const t = this.target(url);
-    if (t.chapter === null) throw new ContentError("Adresa neodkazuje na kapitolu.", false);
-
-    // odstup mezi kapitolami – web omezuje rychlost požadavků
-    const now = Date.now();
-    const slot = Math.max(now, this.lastChapterAt + this.chapterIntervalMs); // i souběžná stahování jdou za sebou
-    this.lastChapterAt = slot;
-    if (slot > now) await sleep(slot - now);
-    if (opts?.signal?.aborted) throw new DOMException("Přerušeno", "AbortError");
-
-    // 1) rozhraní čtečky, 2) stránka kapitoly (statická data, pak vykreslení ve WKWebView)
-    const api = await this.readerApi(t, url, opts);
-    let ch = api.chapter;
-    if (!ch) {
-      const html = await this.load(url, (h) => !!this.readChapter(h, t), opts, this.renderDelayMs);
-      ch = this.readChapter(html, t);
+    if (!opts?.fresh && this.sessionCache && Date.now() - this.sessionCache.at < 60_000) return this.sessionCache.state;
+    let state: SessionState = "unknown";
+    try {
+      const res = await http.get(`${t.origin}/api/auth/get-session`, { timeoutMs: 20000, signal: opts?.signal, headers: { Accept: "application/json", Referer: t.novelUrl } });
+      const body = tryJson(res.data);
+      if (res.ok && (body === null || isObj(body))) {
+        const b = (body ?? {}) as Obj;
+        const session = isObj(b.session) ? b.session : null;
+        const user = b.user ?? session?.user ?? (isObj(b.data) ? b.data.user : undefined) ?? (session && isObj(session.session) ? session.session.user : undefined);
+        state = user && (typeof user === "string" || isObj(user)) ? "signed-in" : "signed-out";
+        // prázdná odpověď 200 bez JSON (null) = žádná relace
+        if (body === null && (res.data ?? "").trim() !== "" && (res.data ?? "").trim() !== "null") state = "unknown";
+      }
+    } catch (err) {
+      if (isAbort(err)) throw err;
     }
-    if (!ch) {
-      throw new ContentError(
-        `Text kapitoly ${t.chapter} se na WTR-LAB nepodařilo načíst – stránka ho nevrátila ani po vykreslení.${api.reason ? ` Rozhraní čtečky: ${api.reason}.` : ""} Web možná vyžaduje přihlášení nebo ověření; to aplikace neobchází.`,
+    this.sessionCache = { at: Date.now(), state };
+    return state;
+  }
+
+  /**
+   * Jeden požadavek na rozhraní čtečky (/api/reader/get) v JEDNOM překladu –
+   * stejný požadavek, jaký posílá stránka kapitoly. Překlady se nikdy
+   * nekombinují: když zvolený není dostupný, vyhodí se chyba s důvodem.
+   * Nic se nedešifruje a žádné ověření se neobchází.
+   */
+  private async readerRequest(t: WtrUrl, mode: string, pageUrl: string, opts?: FetchOptions): Promise<{ title: string; html: string }> {
+    const label = modeLabel(mode);
+    let res;
+    try {
+      res = await http.postJson(
+        `${t.origin}/api/reader/get`,
+        { translate: mode, language: t.lang, raw_id: Number(t.id), chapter_no: t.chapter, retry: false, force_retry: false },
+        { signal: opts?.signal, timeoutMs: 30000, headers: { Referer: pageUrl } },
+      );
+    } catch (err) {
+      if (isAbort(err) || (err as { critical?: boolean })?.critical === true) throw err;
+      throw new AccessError("network", (err as Error)?.message || "Chyba sítě");
+    }
+    const json = tryJson(res.data);
+    if (!isObj(json)) {
+      const access = classifyHttp(res.status, res.headers, res.data, "WTR-LAB");
+      if (access) throw access;
+      if (res.status >= 500) throw new ContentError(`WTR-LAB: chyba serveru (HTTP ${res.status}).`, true);
+      throw parserError(`rozhraní čtečky vrátilo neočekávanou odpověď (HTTP ${res.status}, není JSON)`);
+    }
+    const message = [json.error, json.message, json.code].filter((x) => typeof x === "string").join(" – ");
+    if (json.requireTurnstile || json.code === 1401) {
+      throw new AccessError("challenge", "WTR-LAB vyžaduje bezpečnostní ověření (Turnstile). Ověření musíte provést sami na webu; aplikace ho neobchází.", { status: res.status });
+    }
+    if (/challenge/i.test(headerOf(res.headers, "cf-mitigated"))) throw classifyHttp(res.status, res.headers, "", "WTR-LAB")!;
+    if (res.status === 429) throw classifyHttp(429, res.headers, "", "WTR-LAB")!;
+    const locked = json.code === "CHAPTER_LOCKED" || (isObj(json.chapter) && json.chapter.locked === true);
+    if (locked || res.status === 401 || looksLikeLoginMessage(message)) {
+      // Zamčeno pro nepřihlášené (registrace), nebo zamčeno i pro přihlášené (odemčení na webu)?
+      const session = res.status === 401 || looksLikeLoginMessage(message) ? "signed-out" : await this.checkSession(pageUrl, { signal: opts?.signal, fresh: true });
+      if (session === "signed-in") {
+        throw new AccessError("translation-locked", `Překlad ${label} je u kapitoly ${t.chapter} zamčený i pro přihlášený účet${message ? ` (${message})` : ""}.`, { status: res.status });
+      }
+      throw new AccessError(
+        "login-required",
+        `Překlad ${label} kapitoly ${t.chapter} je na WTR-LAB dostupný jen přihlášeným uživatelům${session === "unknown" ? " (stav přihlášení se nepodařilo ověřit)" : ""}${message ? ` (${message})` : ""}.`,
+        { status: res.status },
       );
     }
+    if (res.status === 403) throw new AccessError("forbidden", `WTR-LAB odmítl přístup (HTTP 403)${message ? ` – ${message}` : ""}.`, { status: 403 });
+    if (res.status === 404 || res.status === 410) throw new AccessError("unavailable", `Kapitola ${t.chapter} na WTR-LAB neexistuje (HTTP ${res.status}).`, { status: res.status });
+    if (!res.ok || json.success === false || json.error) {
+      if (res.status >= 500) throw new ContentError(`WTR-LAB: chyba serveru (HTTP ${res.status})${message ? ` – ${message}` : ""}.`, true);
+      throw new AccessError("unavailable", `Překlad ${label} kapitoly ${t.chapter} web nevydal (HTTP ${res.status}${message ? ` – ${message}` : ""}).`, { status: res.status });
+    }
+
+    let content: unknown = isObj(json.data) ? json.data.data : undefined;
+    if (!(isObj(content) && content.body !== undefined) && typeof json.content_url === "string" && json.content_url) {
+      const target = absoluteUrl(t.origin, json.content_url);
+      let host = "";
+      try {
+        host = new URL(target).hostname;
+      } catch {
+        /* neplatná adresa */
+      }
+      if (!/(^|\.)wtr-lab\.com$/i.test(host)) throw parserError("obsah kapitoly odkazuje mimo web");
+      let payload;
+      try {
+        payload = await http.get(target, { timeoutMs: 30000, signal: opts?.signal, headers: { Accept: "application/json", Referer: pageUrl } });
+      } catch (err) {
+        if (isAbort(err)) throw err;
+        throw new AccessError("network", (err as Error)?.message || "Chyba sítě");
+      }
+      const parsed = tryJson(payload.data);
+      if (!isObj(parsed)) {
+        const access = classifyHttp(payload.status, payload.headers, payload.data, "WTR-LAB");
+        if (access) throw access;
+        throw parserError(`obsah kapitoly se nepodařilo načíst (HTTP ${payload.status})`);
+      }
+      content = isObj(parsed.data) ? parsed.data.data : undefined;
+    }
+    if (!isObj(content) || content.body === undefined) throw parserError("odpověď neobsahuje text kapitoly");
+
+    // Nikdy neuložit kapitolu jiné knihy: odpověď musí odpovídat tomu, co bylo vyžádáno.
+    const mismatch = identityMismatch(json.chapter, t) ?? identityMismatch(json.data, t) ?? identityMismatch(content, t);
+    if (mismatch) throw wrongContent(mismatch);
+
+    const rawBody = content.body;
+    const first = typeof rawBody === "string" ? rawBody : Array.isArray(rawBody) && typeof rawBody[0] === "string" ? rawBody[0] : "";
+    if (!Array.isArray(rawBody) || !rawBody.every((x) => typeof x === "string") || /^(arr|str):/.test(first)) {
+      throw new AccessError("mode-unsupported", `Překlad ${label} vydává WTR-LAB v chráněné podobě, kterou si překládá až stránka v prohlížeči. Aplikace takový obsah nedešifruje.`);
+    }
+    const terms = isObj(content.glossary_data) && Array.isArray(content.glossary_data.terms) ? (content.glossary_data.terms as unknown[]) : [];
+    const patch = Array.isArray(content.patch) ? (content.patch as unknown[]) : [];
+    const fix = (text: string) => {
+      let out = text.replace(/※(\d+)[⛬〓]/g, (m, i) => {
+        const term = terms[Number(i)];
+        const value = Array.isArray(term) ? term[0] : undefined;
+        return typeof value === "string" && value ? value : m;
+      });
+      for (const p of patch) if (isObj(p) && typeof p.zh === "string" && p.zh && typeof p.en === "string") out = out.split(p.zh).join(` ${p.en}`);
+      return resolveTokens(out);
+    };
+    const paragraphs = (rawBody as string[]).filter((x) => x.trim() && x.trim() !== "[image]").map(fix);
+    if (paragraphs.some((p) => /※\d+[⛬〓]/.test(p))) throw parserError("v textu zůstaly nevyplněné zástupné značky");
+    const xhtml = paragraphs.flatMap((p) => p.split(/\n+/)).map((p) => p.trim()).filter(Boolean).map((p) => `<p>${escapeXml(p)}</p>`).join("\n");
+    const cleaned = stripBoilerplateXhtml(xhtml, { siteNames: SITE_NAMES }).html;
+    if (htmlToText(cleaned).length < 120) throw parserError("text kapitoly je příliš krátký");
+    const rawTitle = (isObj(json.chapter) && typeof json.chapter.title === "string" && json.chapter.title) || (typeof content.title === "string" ? content.title : "");
+    return { title: fix(rawTitle), html: cleaned };
+  }
+
+  /** Odstup mezi požadavky na kapitoly – web omezuje rychlost čtení. */
+  private async chapterSlot(signal?: AbortSignal): Promise<void> {
+    const now = Date.now();
+    const slot = Math.max(now, this.lastChapterAt + this.chapterIntervalMs); // i souběžná volání jdou za sebou
+    this.lastChapterAt = slot;
+    if (slot > now) await sleep(slot - now);
+    if (signal?.aborted) throw new DOMException("Přerušeno", "AbortError");
+  }
+
+  /**
+   * Text kapitoly ve zvoleném překladu. Bez volby se použije AI (jediný překlad,
+   * který starší verze aplikace stahovaly). Stránka kapitoly se už nevykresluje
+   * ve WKWebView: z vykreslené stránky nejde spolehlivě poznat, který překlad
+   * zobrazuje, a překlady se nesmějí míchat.
+   */
+  async fetchChapter(url: string, opts?: FetchOptions): Promise<{ title: string; html: string; translationMode: string }> {
+    const t = this.target(url);
+    if (t.chapter === null) throw new ContentError("Adresa neodkazuje na kapitolu.", false);
+    const mode = normalizeWtrMode(opts?.translationMode) ?? WTR_DEFAULT_MODE;
+    await this.chapterSlot(opts?.signal);
+    const ch = await this.readerRequest(t, mode, url, opts);
     assertChapterContent(ch.html);
     const title = stripSiteSuffix(ch.title);
-    return { title: title && !SITE_TITLE_RE.test(title) ? title : `Chapter ${t.chapter}`, html: ch.html };
+    return { title: title && !SITE_TITLE_RE.test(title) ? title : `Chapter ${t.chapter}`, html: ch.html, translationMode: mode };
+  }
+
+  /**
+   * Zjistí, které překlady web pro danou kapitolu skutečně vydá: pošle pro každý
+   * jeden běžný požadavek čtečky a výsledek zařadí. Při bezpečnostním ověření
+   * nebo omezení požadavků se další překlady nezkouší.
+   */
+  override async probeTranslationModes(chapterUrl: string, opts?: FetchOptions): Promise<ModeProbe[]> {
+    const t = this.target(chapterUrl);
+    if (t.chapter === null) throw new ContentError("Adresa neodkazuje na kapitolu.", false);
+    const out: ModeProbe[] = [];
+    let blocked: ModeProbe | null = null;
+    for (const m of WTR_MODES) {
+      if (blocked) {
+        out.push({ mode: m.id, label: m.label, state: "unknown", message: "Neověřeno – web mezitím požádal o ověření nebo omezil požadavky." });
+        continue;
+      }
+      await this.chapterSlot(opts?.signal);
+      try {
+        await this.readerRequest(t, m.id, chapterUrl, opts);
+        out.push({ mode: m.id, label: m.label, state: "available", message: "Dostupný" });
+      } catch (err) {
+        if (isAbort(err)) throw err;
+        const kind = accessKindOf(err);
+        const probe: ModeProbe = { mode: m.id, label: m.label, state: kind ?? "parser", message: (err as Error)?.message ?? "Neznámá chyba" };
+        out.push(probe);
+        if (kind === "challenge" || kind === "rate-limited") blocked = probe;
+      }
+    }
+    return out;
   }
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { parserInfo } from "@/services/parser/registry";
 import { useParams, useNavigate } from "react-router-dom";
 import { db } from "@/services/db";
 import { generateEpub, generateTxt, generateHtml, type EpubChapter } from "@/services/epub";
@@ -14,7 +15,7 @@ import { Image as ImageIcon, RotateCw, Share as ShareIcon, FileText, Download as
 
 type SplitMode = "single" | "chapters" | "range";
 
-type ChapterPick = { id: string; title: string; url: string; orderIndex: number; status: string; filePath?: string; checksum?: string };
+type ChapterPick = { id: string; title: string; url: string; orderIndex: number; status: string; filePath?: string; checksum?: string; translationMode?: string };
 
 export function EpubExport() {
   const { id } = useParams<{ id: string }>();
@@ -138,14 +139,21 @@ export function EpubExport() {
 
       let out;
       if (format === "epub") {
-        const res = await generateEpub(p, selected, coverToUse, mimeToUse, (done, total) =>
-          setProgress(15 + Math.round((done / total) * 75)),
+        // Kniha se v metadatech i na úvodní stránce označí jako neúplná a uvede použitý překlad.
+        const modes = parserInfo(p.sourceUrl).translationModes;
+        const used = [...new Set((selected as ChapterPick[]).map((c) => c.translationMode).filter((m): m is string => !!m))];
+        const translations = used.map((m) => modes.find((x) => x.id === m)?.label ?? m);
+        const res = await generateEpub(
+          p, selected, coverToUse, mimeToUse,
+          (done, total) => setProgress(15 + Math.round((done / total) * 75)),
+          { incomplete: downloaded.length < wanted.length ? { included: selected.length, total: wanted.length } : undefined, translations },
         );
         out = res;
         const notes: string[] = [];
         if (!coverToUse) notes.push("Kniha nemá obálku.");
         if (res.missing.length) notes.push(`${res.missing.length} kapitol nemělo uložený text a v knize chybí (např. ${res.missing.slice(0, 3).join(", ")}).`);
-        if (downloaded.length < wanted.length) notes.push(`Kniha je neúplná: obsahuje jen stažené kapitoly (${downloaded.length} z ${wanted.length}).`);
+        if (downloaded.length < wanted.length) notes.push(`Kniha je neúplná: obsahuje jen stažené kapitoly (${downloaded.length} z ${wanted.length}). Je tak označená i v názvu a na úvodní stránce.`);
+        if (translations.length > 1) notes.push(`Kniha obsahuje kapitoly ve více překladech (${translations.join(", ")}) – formulace a názvy se mohou lišit.`);
         if (res.suspicious.length) notes.push(`U ${res.suspicious.length} kapitol zůstal text připomínající reklamu nebo navigaci (např. ${res.suspicious.slice(0, 3).join(", ")}) – opravte je v detailu projektu.`);
         setNotice(notes.join(" "));
       } else if (format === "txt") {

@@ -92,10 +92,16 @@ function rowToProject(row: Record<string, unknown>): Project {
     updatedAt: String(row.updated_at),
     lastCheckAt: row.last_check_at ? String(row.last_check_at) : undefined,
     epubPath: row.epub_path ? String(row.epub_path) : undefined,
+    accessKind: row.access_kind ? String(row.access_kind) : undefined,
+    accessMessage: row.access_message ? String(row.access_message) : undefined,
     settings: {
       concurrentRequests: Number(row.concurrent_requests ?? DEFAULT_SETTINGS.concurrentRequests),
       delayMs: Number(row.delay_ms ?? DEFAULT_SETTINGS.delayMs),
       maxRetries: Number(row.max_retries ?? DEFAULT_SETTINGS.maxRetries),
+      translationMode: row.translation_mode ? String(row.translation_mode) : undefined,
+      speedMode: row.speed_mode === "eco" || row.speed_mode === "fast" ? row.speed_mode : "balanced",
+      wifiOnly: Number(row.wifi_only ?? 0) === 1,
+      chargingOnly: Number(row.charging_only ?? 0) === 1,
     },
   };
 }
@@ -115,6 +121,8 @@ function rowToChapter(row: Record<string, unknown>): Chapter {
     errorMessage: row.error_message ? String(row.error_message) : undefined,
     retryCount: row.retry_count ? Number(row.retry_count) : 0,
     downloadedAt: row.downloaded_at ? String(row.downloaded_at) : undefined,
+    translationMode: row.translation_mode ? String(row.translation_mode) : undefined,
+    errorKind: row.error_kind ? String(row.error_kind) : undefined,
     excluded: Number(row.excluded ?? 0) === 1,
   };
 }
@@ -206,6 +214,26 @@ export class CapacitorDatabase implements Database {
     if (names.size > 0 && !names.has("excluded")) {
       await exec("ALTER TABLE chapters ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0;");
     }
+    // v1.3.0: překladová varianta a druh chyby u kapitol; režimy a přístupový stav u projektů
+    if (names.size > 0) {
+      if (!names.has("translation_mode")) await exec("ALTER TABLE chapters ADD COLUMN translation_mode TEXT;");
+      if (!names.has("error_kind")) await exec("ALTER TABLE chapters ADD COLUMN error_kind TEXT;");
+    }
+    const pcols = await query<{ name?: string }>("PRAGMA table_info(projects)");
+    const pnames = new Set(pcols.map((c) => String(c.name ?? "")));
+    if (pnames.size > 0) {
+      const add: Array<[string, string]> = [
+        ["translation_mode", "TEXT"],
+        ["speed_mode", "TEXT"],
+        ["wifi_only", "INTEGER NOT NULL DEFAULT 0"],
+        ["charging_only", "INTEGER NOT NULL DEFAULT 0"],
+        ["access_kind", "TEXT"],
+        ["access_message", "TEXT"],
+      ];
+      for (const [name, type] of add) {
+        if (!pnames.has(name)) await exec(`ALTER TABLE projects ADD COLUMN ${name} ${type};`);
+      }
+    }
   }
 
   async getProjects(): Promise<Project[]> {
@@ -253,6 +281,10 @@ export class CapacitorDatabase implements Database {
         s.maxRetries,
       ]
     );
+    // Novější nastavení (překlad, rychlost, podmínky) mají vlastní sloupce.
+    if (s.translationMode !== undefined || s.speedMode !== undefined || s.wifiOnly !== undefined || s.chargingOnly !== undefined) {
+      await this.updateProject(id, { settings: s });
+    }
     return { id, ...project, createdAt: now, updatedAt: now, settings: s } as Project;
   }
 
@@ -283,7 +315,13 @@ export class CapacitorDatabase implements Database {
       set("concurrent_requests", patch.settings.concurrentRequests);
       set("delay_ms", patch.settings.delayMs);
       set("max_retries", patch.settings.maxRetries);
+      if (patch.settings.translationMode !== undefined) set("translation_mode", patch.settings.translationMode || null);
+      if (patch.settings.speedMode !== undefined) set("speed_mode", patch.settings.speedMode);
+      if (patch.settings.wifiOnly !== undefined) set("wifi_only", patch.settings.wifiOnly ? 1 : 0);
+      if (patch.settings.chargingOnly !== undefined) set("charging_only", patch.settings.chargingOnly ? 1 : 0);
     }
+    if (patch.accessKind !== undefined) set("access_kind", patch.accessKind || null);
+    if (patch.accessMessage !== undefined) set("access_message", patch.accessMessage || null);
     if (!fields.length) return;
     set("updated_at", new Date().toISOString());
     values.push(id);
@@ -354,6 +392,8 @@ export class CapacitorDatabase implements Database {
     if (patch.retryCount !== undefined) set("retry_count", patch.retryCount);
     if (patch.downloadedAt !== undefined) set("downloaded_at", patch.downloadedAt ?? null);
     if (patch.excluded !== undefined) set("excluded", patch.excluded ? 1 : 0);
+    if (patch.translationMode !== undefined) set("translation_mode", patch.translationMode || null);
+    if (patch.errorKind !== undefined) set("error_kind", patch.errorKind || null);
     if (!fields.length) return;
     values.push(id);
     await run(`UPDATE chapters SET ${fields.join(", ")} WHERE id = ?`, values);

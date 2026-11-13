@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import { DownloadControls } from "@/components/DownloadControls";
 import { useParams, useNavigate } from "react-router-dom";
 import { db } from "@/services/db";
 import { downloadManager } from "@/services/downloader";
@@ -239,7 +240,9 @@ export function ProjectDetail() {
         </div>
       </Card>
 
-      {runError && !isDownloading && (
+      <DownloadControls project={project} running={isDownloading} onChanged={() => void loadAll()} />
+
+      {runError && !isDownloading && !project.accessMessage && (
         <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm flex gap-2" role="alert">
           <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" /> <span>{runError}</span>
         </div>

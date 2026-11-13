@@ -67,6 +67,8 @@ export default function App() {
       listener = await CapApp.addListener("appStateChange", (state) => {
         // iOS smí aplikaci na pozadí ukončit – v logu se to odliší od pádu.
         diag.log(state?.isActive ? "app-foreground" : "app-background");
+        // Správce stahování na pozadí nezačíná nové kapitoly a po návratu pokračuje sám.
+        downloadManager.setAppActive(!!state?.isActive);
         store.refresh();
       });
     })();

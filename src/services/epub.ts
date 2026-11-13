@@ -151,7 +151,42 @@ interface CoverRef {
   mime: string;
 }
 
-function opf(project: Project, lang: string, chapters: EpubChapter[], cover: CoverRef | null, modified: string): string {
+/** Doplňující údaje o knize: neúplnost a použité překlady. */
+export interface EpubNote {
+  /** Kniha neobsahuje všechny kapitoly projektu. */
+  incomplete?: { included: number; total: number };
+  /** Názvy překladů, ve kterých jsou kapitoly uložené (víc než jeden = smíšená kniha). */
+  translations?: string[];
+}
+
+function noteLines(note: EpubNote | undefined): string[] {
+  const lines: string[] = [];
+  if (note?.incomplete) lines.push(`Neúplná kniha: obsahuje ${note.incomplete.included} z ${note.incomplete.total} kapitol.`);
+  const tr = (note?.translations ?? []).filter(Boolean);
+  if (tr.length === 1) lines.push(`Překlad: ${tr[0]}.`);
+  if (tr.length > 1) lines.push(`Kniha obsahuje kapitoly ve více překladech (${tr.join(", ")}); formulace a názvy se mohou mezi kapitolami lišit.`);
+  return lines;
+}
+
+function noticeXhtml(project: Project, lang: string, lines: string[]): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="${esc(lang)}" lang="${esc(lang)}">
+<head>
+  <meta charset="UTF-8"/>
+  <title>${esc(project.title)}</title>
+  <link rel="stylesheet" type="text/css" href="styles.css"/>
+</head>
+<body>
+  <section class="chapter" xml:lang="cs" lang="cs">
+    <h1>${esc(project.title)}</h1>
+${lines.map((l) => `    <p>${esc(l)}</p>`).join("\n")}
+  </section>
+</body>
+</html>`;
+}
+
+function opf(project: Project, lang: string, chapters: EpubChapter[], cover: CoverRef | null, modified: string, note?: EpubNote): string {
   const uid = `urn:uuid:${project.id}`;
   const manifest: string[] = [];
   const spine: string[] = [];
@@ -167,6 +202,11 @@ function opf(project: Project, lang: string, chapters: EpubChapter[], cover: Cov
   manifest.push(`    <item id="css" href="styles.css" media-type="text/css"/>`);
   manifest.push(`    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>`);
   manifest.push(`    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>`);
+  const lines = noteLines(note);
+  if (lines.length) {
+    manifest.push(`    <item id="notice" href="notice.xhtml" media-type="application/xhtml+xml"/>`);
+    spine.push(`    <itemref idref="notice"/>`);
+  }
   chapters.forEach((_c, i) => {
     manifest.push(`    <item id="chap-${i + 1}" href="${chapterFile(i)}" media-type="application/xhtml+xml"/>`);
     spine.push(`    <itemref idref="chap-${i + 1}"/>`);
@@ -174,14 +214,15 @@ function opf(project: Project, lang: string, chapters: EpubChapter[], cover: Cov
 
   const meta: string[] = [
     `    <dc:identifier id="bookid">${esc(uid)}</dc:identifier>`,
-    `    <dc:title>${esc(project.title)}</dc:title>`,
+    `    <dc:title>${esc(project.title + (note?.incomplete ? ` (neúplné: ${note.incomplete.included} z ${note.incomplete.total} kapitol)` : ""))}</dc:title>`,
     `    <dc:language>${esc(lang)}</dc:language>`,
   ];
   if (project.author) {
     meta.push(`    <dc:creator id="creator">${esc(project.author)}</dc:creator>`);
     meta.push(`    <meta refines="#creator" property="role" scheme="marc:relators">aut</meta>`);
   }
-  if (project.description) meta.push(`    <dc:description>${esc(project.description)}</dc:description>`);
+  const description = [...lines, project.description ?? ""].filter(Boolean).join(" ");
+  if (description) meta.push(`    <dc:description>${esc(description)}</dc:description>`);
   if (project.sourceUrl) meta.push(`    <dc:source>${esc(project.sourceUrl)}</dc:source>`);
   meta.push(`    <meta property="dcterms:modified">${esc(modified)}</meta>`);
   if (cover) meta.push(`    <meta name="cover" content="cover-image"/>`);
@@ -232,6 +273,7 @@ export async function buildEpubDetailed(
   coverBase64?: string,
   coverMime = "image/jpeg",
   onProgress?: (done: number, total: number) => void,
+  note?: EpubNote,
 ): Promise<EpubBuildResult> {
   const zip = new JSZip();
   const lang = normalizeLanguage(project.language, "en");
@@ -279,7 +321,10 @@ export async function buildEpubDetailed(
   zip.file("OEBPS/nav.xhtml", navXhtml(project, lang, included));
   // dcterms:modified musí být přesně CCYY-MM-DDThh:mm:ssZ (bez milisekund)
   const modified = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-  zip.file("OEBPS/content.opf", opf(project, lang, included, cover, modified));
+  // Počet v poznámce o neúplnosti odpovídá kapitolám, které v knize opravdu jsou.
+  const finalNote: EpubNote | undefined = note ? { ...note, incomplete: note.incomplete ? { ...note.incomplete, included: included.length } : undefined } : undefined;
+  if (noteLines(finalNote).length) zip.file("OEBPS/notice.xhtml", noticeXhtml(project, lang, noteLines(finalNote)));
+  zip.file("OEBPS/content.opf", opf(project, lang, included, cover, modified, finalNote));
 
   const data = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", mimeType: "application/epub+zip" });
   return { data, missing, chapterCount: included.length, suspicious };
@@ -300,9 +345,10 @@ export async function generateEpub(
   coverBase64?: string,
   coverMime = "image/jpeg",
   onProgress?: (done: number, total: number) => void,
+  note?: EpubNote,
 ): Promise<{ path: string; size: number; missing: string[]; chapterCount: number; suspicious: string[] }> {
   await storage.init();
-  const built = await buildEpubDetailed(project, chapters, coverBase64, coverMime, onProgress);
+  const built = await buildEpubDetailed(project, chapters, coverBase64, coverMime, onProgress, note);
   const fileName = `${safeName(project.title)}-${project.id.slice(0, 8)}.epub`;
   const path = storage.epubPath(fileName);
   // BINÁRNÍ zápis. Dřív se base64 zapisoval s Encoding.UTF8, takže soubor

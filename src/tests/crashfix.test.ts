@@ -145,7 +145,6 @@ vi.mock("@/services/render", () => {
 import { downloadManager, effectiveConcurrency } from "@/services/downloader";
 import { getParser, parserInfo } from "@/services/parser/registry";
 import { identityMismatch } from "@/services/parser/wtrlab";
-import { RenderError } from "@/services/render";
 import { diag, DIAG_FILE } from "@/services/diag";
 import type { Project } from "@/types";
 
@@ -331,29 +330,24 @@ describe("chyby během stahování", () => {
     expect(count("downloaded")).toBe(60);
   }, 30000);
 
-  it("chyba WKWebView (běžná): kapitola selže s důvodem, aplikace pokračuje další", async () => {
+  it("kapitoly WTR-LAB se nevykreslují ve WKWebView ani při chybě rozhraní", async () => {
     seed(13, 10);
-    h.http.post = async (_u, body) => (body.chapter_no === 11 ? ok({ requireTurnstile: true }) : reader(body.raw_id, body.chapter_no));
-    h.http.get = async (url) => ({ ok: true, status: 200, data: "<html><head><title>Reader</title></head><body><div id=\"__next\"></div></body></html>", url, headers: {} });
-    h.render.impl = async () => {
-      throw new RenderError("Rendering timeout");
-    };
+    h.http.post = async (_u, body) => (body.chapter_no === 11 ? ok({ success: true, data: { data: { title: "x" } } }) : reader(body.raw_id, body.chapter_no));
     await downloadManager.startProject(project(3));
-    expect(h.render.calls).toEqual([chapterUrl(11)]);
-    expect(h.chapters[10]).toMatchObject({ status: "failed" });
-    expect(h.chapters[10].errorMessage).toMatch(/Turnstile|ověření/);
+    expect(h.render.calls).toEqual([]);
+    expect(h.chapters[10]).toMatchObject({ status: "failed", errorKind: "parser" });
     expect(count("downloaded")).toBe(12);
-    expect(h.render.maxInFlight).toBe(1);
   });
 
-  it("kritická chyba WKWebView (pád procesu / paměť): stahování se hned pozastaví, kapitola zůstane ve frontě", async () => {
+  it("kritická chyba (pád procesu / paměť): stahování se hned pozastaví, kapitola zůstane ve frontě", async () => {
     seed(3138, 10);
-    h.http.post = async (_u, body) => (body.chapter_no >= 13 ? ok({ requireTurnstile: true }) : reader(body.raw_id, body.chapter_no));
-    h.render.impl = async () => {
-      throw new RenderError("Web content process terminated (possibly out of memory)", true);
+    let n = 0;
+    h.http.post = async (_u, body) => {
+      if (++n === 3) throw Object.assign(new Error("Web content process terminated (possibly out of memory)"), { critical: true });
+      return reader(body.raw_id, body.chapter_no);
     };
     await downloadManager.startProject(project(3));
-    expect(h.render.calls).toEqual([chapterUrl(13)]); // žádné další pokusy
+    expect(n).toBe(3); // žádné další pokusy
     expect(h.projectRow.status).toBe("paused");
     expect(count("downloaded")).toBe(12);
     expect(count("failed")).toBe(0);
@@ -436,29 +430,6 @@ describe("kapitola jiné knihy se nikdy neuloží", () => {
     expect(h.files["NovelForge/projects/p1/c11.html"]).toBeUndefined();
   });
 
-  it("vykreslená stránka přesměrovaná na jinou novelu se neuloží", async () => {
-    seed(11, 10);
-    h.http.post = async () => ok({ requireTurnstile: true });
-    const body = TEXT(11).map((p) => `<p>${p}</p>`).join("");
-    h.render.impl = async () => ({
-      html: `<html><body><h1>Black spear!</h1><div class="chapter-body">${body}</div></body></html>`,
-      url: "https://wtr-lab.com/en/novel/4521/another-book/chapter-11",
-    });
-    await downloadManager.startProject(project(1));
-    expect(h.chapters[10].status).toBe("failed");
-    expect(h.chapters[10].errorMessage).toMatch(/přesměrována/);
-    expect(h.files["NovelForge/projects/p1/c11.html"]).toBeUndefined();
-  });
-
-  it("vykreslená stránka se správnou adresou se uloží", async () => {
-    seed(11, 10);
-    h.http.post = async () => ok({ requireTurnstile: true });
-    const body = TEXT(11).map((p) => `<p>${p}</p>`).join("");
-    h.render.impl = async (url) => ({ html: `<html><body><h1>Chapter title 11</h1><div class="chapter-body">${body}</div></body></html>`, url });
-    await downloadManager.startProject(project(1));
-    expect(h.chapters[10].status).toBe("downloaded");
-    expect(h.files["NovelForge/projects/p1/c11.html"]).toContain("Synthetic filler paragraph 1 of chapter 11");
-  });
 });
 
 describe("diagnostický záznam stahování", () => {
@@ -468,9 +439,9 @@ describe("diagnostický záznam stahování", () => {
     await diag.flush();
     const text = h.diagFiles[DIAG_FILE];
     expect(text).toMatch(/ run-start op=\d+ project="p1" source="wtr-lab\.com"/);
-    expect(text).toMatch(/ queue project="p1" parser="wtrlab" total=12 downloaded=10 pending=2 concurrency=1 requested=3/);
-    expect(text).toMatch(/ chapter-start op=\d+ project="p1" parser="wtrlab" no="11" index=0 url=https:\/\/wtr-lab\.com\/en\/novel\/7898\/i-created-the-longevity-club\/chapter-11/);
-    expect(text).toMatch(/ chapter-end op=\d+ ms=\d+ ok=true attempts=1 bytes=\d+/);
+    expect(text).toMatch(/ queue project="p1" parser="wtrlab" total=12 downloaded=10 pending=2 concurrency=1 requested=3 delayMs=0 speed="balanced" translation="ai"/);
+    expect(text).toMatch(/ chapter-start op=\d+ project="p1" parser="wtrlab" no="11" index=0 translation="ai" url=https:\/\/wtr-lab\.com\/en\/novel\/7898\/i-created-the-longevity-club\/chapter-11/);
+    expect(text).toMatch(/ chapter-end op=\d+ ms=\d+ ok=true attempts=1 bytes=\d+ fetchMs=\d+ cleanMs=\d+ writeMs=\d+ dbMs=\d+/);
     expect(text).toMatch(/ run-end op=\d+ ms=\d+ ok=true/);
     expect(text).not.toContain("Synthetic filler");
     for (const line of text.trim().split("\n")) expect(line).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z \S+/);

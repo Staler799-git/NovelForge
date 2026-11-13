@@ -1,5 +1,19 @@
 export type ChapterStatus = "pending" | "downloaded" | "failed" | "skipped";
-export type ProjectStatus = "idle" | "downloading" | "paused" | "completed" | "failed";
+export type ProjectStatus =
+  | "idle"
+  | "downloading"
+  | "paused"
+  | "completed"
+  | "failed"
+  /** Zdroj vyžaduje přihlášení nebo odemčení překladu. */
+  | "waiting-auth"
+  /** Zdroj vyžaduje bezpečnostní ověření (Cloudflare, CAPTCHA). */
+  | "verification-required"
+  /** Zdroj opakovaně omezuje počet požadavků. */
+  | "rate-limited";
+/** Překladová varianta zdroje (WTR-LAB: web, webplus, ai). */
+export type TranslationMode = string;
+export type SpeedMode = "eco" | "balanced" | "fast";
 export type ExportFormat = "epub" | "txt" | "html";
 
 export interface NovelMetadata {
@@ -29,6 +43,10 @@ export interface Chapter {
   errorMessage?: string;
   retryCount?: number;
   downloadedAt?: string;
+  /** Překladová varianta, ve které je uložený text (jen u zdrojů s více překlady). */
+  translationMode?: TranslationMode;
+  /** Druh poslední chyby (viz services/access.ts). */
+  errorKind?: string;
   /**
    * true = alternativní verze kapitoly, kterou uživatel nevybral. Adresa i
    * případný stažený soubor zůstávají, ale kapitola se nestahuje, nepočítá a
@@ -56,6 +74,9 @@ export interface Project {
   updatedAt: string;
   lastCheckAt?: string;
   epubPath?: string;
+  /** Poslední přístupová překážka (druh + zpráva); prázdné = žádná. */
+  accessKind?: string;
+  accessMessage?: string;
   settings?: ProjectSettings;
 }
 
@@ -63,6 +84,13 @@ export interface ProjectSettings {
   concurrentRequests: number;
   delayMs: number;
   maxRetries: number;
+  /** Překlad, který projekt používá. Bez potvrzení uživatele se nemění. */
+  translationMode?: TranslationMode;
+  speedMode?: SpeedMode;
+  /** Stahovat jen přes Wi-Fi. */
+  wifiOnly?: boolean;
+  /** Stahovat jen při nabíjení. */
+  chargingOnly?: boolean;
 }
 
 export interface DownloadResult {
@@ -92,6 +120,8 @@ export interface CatalogProgress {
 
 export interface FetchOptions {
   signal?: AbortSignal;
+  /** Překlad, který se má stáhnout (jen u zdrojů s více překlady). */
+  translationMode?: TranslationMode;
   onProgress?: (p: CatalogProgress) => void;
 }
 
