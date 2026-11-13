@@ -6,14 +6,13 @@ import { downloadManager } from "@/services/downloader";
 import { storage } from "@/services/storage";
 import { projectStore } from "@/store";
 import { isAbort } from "@/services/http";
-import { analyzeCatalog, compareSeries, findGaps, type SeriesComparison } from "@/services/catalog";
+import { analyzeLogical, selectVariant, verifyAlternatives, findGaps, type AlternativeCheck, type VariantChoice } from "@/services/catalog";
 import { generatePlaceholderCover, downloadCover, saveCover, pickCoverFromGallery, coverDataUri, type CoverData } from "@/services/cover";
 import type { CatalogProgress, CatalogResult, NovelMetadata, ParserChapter } from "@/types";
 import { Card, SectionTitle, Button, Input, Textarea, Badge, ProgressBar } from "@/components/ui";
 import { Search, AlertTriangle, List, ChevronRight, Square, Image as ImageIcon, Loader2 } from "lucide-react";
 
 type Step = "url" | "preview";
-type SeriesChoice = "A" | "B" | "all";
 
 const PAGE_SIZE = 200;
 
@@ -23,8 +22,8 @@ export function NewDownload() {
   const [url, setUrl] = useState("");
   const [meta, setMeta] = useState<NovelMetadata | null>(null);
   const [catalog, setCatalog] = useState<CatalogResult | null>(null);
-  const [seriesChoice, setSeriesChoice] = useState<SeriesChoice>("all");
-  const [comparison, setComparison] = useState<SeriesComparison | null>(null);
+  const [variant, setVariant] = useState<VariantChoice>("all");
+  const [comparison, setComparison] = useState<AlternativeCheck | null>(null);
   const [comparing, setComparing] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [visible, setVisible] = useState(PAGE_SIZE);
@@ -50,14 +49,14 @@ export function NewDownload() {
   }, []);
 
   const allChapters = catalog?.chapters ?? [];
-  const analysis = useMemo(() => analyzeCatalog(allChapters), [allChapters]);
+  const analysis = useMemo(() => analyzeLogical(allChapters), [allChapters]);
+  const selection = useMemo(() => selectVariant(allChapters, variant, analysis), [allChapters, variant, analysis]);
 
-  /** Kapitoly zvolené řady, v pořadí katalogu. */
+  /** Kapitoly zvolené verze ve správném pořadí (vyřazené alternativy tu nejsou). */
   const chapters: ParserChapter[] = useMemo(() => {
-    if (analysis.series.length < 2 || seriesChoice === "all") return allChapters;
-    const urls = new Set(analysis.series.find((s) => s.id === seriesChoice)?.urls ?? []);
-    return allChapters.filter((c) => urls.has(c.url));
-  }, [allChapters, analysis, seriesChoice]);
+    const byUrl = new Map(allChapters.map((c) => [c.url, c]));
+    return selection.chapters.filter((c) => !c.excluded).map((c) => ({ ...byUrl.get(c.url)!, orderIndex: c.orderIndex }));
+  }, [allChapters, selection]);
 
   const gaps = useMemo(() => findGaps(chapters), [chapters]);
   const selectedCount = useMemo(() => chapters.filter((c) => selected.has(c.url)).length, [chapters, selected]);
@@ -83,17 +82,12 @@ export function NewDownload() {
 
   const applyCatalog = useCallback((result: CatalogResult) => {
     setCatalog(result);
-    const a = analyzeCatalog(result.chapters);
-    // Dvě řady se nikdy nemíchají automaticky: předvybere se řada s názvy
-    // kapitol (nebo větší), uživatel může volbu změnit.
-    let choice: SeriesChoice = "all";
-    if (a.series.length >= 2) {
-      const [sa, sb] = a.series;
-      choice = sb.count >= sa.count * 0.9 ? "B" : "A";
-    }
-    setSeriesChoice(choice);
-    const urls = choice === "all" ? result.chapters.map((c) => c.url) : (a.series.find((s) => s.id === choice)?.urls ?? []);
-    setSelected(new Set(urls));
+    const a = analyzeLogical(result.chapters);
+    // Alternativní verze se nikdy nemíchají automaticky: předvybere se hlavní
+    // řada (pokrývá celou knihu), uživatel může volbu změnit.
+    const choice: VariantChoice = a.alternatives > 0 ? "plain" : "all";
+    setVariant(choice);
+    setSelected(new Set(selectVariant(result.chapters, choice, a).chapters.filter((c) => !c.excluded).map((c) => c.url)));
     setVisible(PAGE_SIZE);
     setRangeFrom("");
     setRangeTo("");
@@ -118,6 +112,11 @@ export function NewDownload() {
     try {
       const m = await parseMetadata(target, { signal: ctrl.signal });
       if (!mounted.current) return;
+      if (!m.title.trim()) {
+        // Stránka vrátila jen název webu – není to stránka novely. Projekt se nevytvoří.
+        setError("Katalog kapitol nebyl spolehlivě rozpoznán. Stránka neobsahuje údaje o novele – zkontrolujte, že adresa vede na stránku novely.");
+        return;
+      }
       setMeta(m);
       void loadCover(m, ctrl.signal);
       setPhase("Načítám katalog kapitol…");
@@ -138,7 +137,8 @@ export function NewDownload() {
       setStep("preview");
     } catch (err: any) {
       if (!mounted.current) return;
-      setError(isAbort(err) ? "Detekce byla zastavena." : `Novelu se nepodařilo načíst: ${err?.message ?? "neznámá chyba"}`);
+      const msg = String(err?.message ?? "neznámá chyba");
+      setError(isAbort(err) ? "Detekce byla zastavena." : /^Katalog kapitol nebyl spolehlivě rozpoznán/.test(msg) ? msg : `Novelu se nepodařilo načíst: ${msg}`);
     } finally {
       if (mounted.current) {
         setDetecting(false);
@@ -149,21 +149,20 @@ export function NewDownload() {
 
   const stopDetection = () => abortRef.current?.abort();
 
-  const chooseSeries = (choice: SeriesChoice) => {
-    setSeriesChoice(choice);
-    const urls = choice === "all" ? allChapters.map((c) => c.url) : (analysis.series.find((s) => s.id === choice)?.urls ?? []);
-    setSelected(new Set(urls));
+  const chooseVariant = (choice: VariantChoice) => {
+    setVariant(choice);
+    setSelected(new Set(selectVariant(allChapters, choice, analysis).chapters.filter((c) => !c.excluded).map((c) => c.url)));
     setVisible(PAGE_SIZE);
   };
 
   const runComparison = async () => {
-    if (analysis.series.length < 2) return;
+    if (analysis.alternatives === 0) return;
     setComparing(true);
     setComparison(null);
     try {
-      setComparison(await compareSeries(allChapters, analysis.series[0], analysis.series[1], (u) => parseChapter(u)));
+      setComparison(await verifyAlternatives(allChapters, (u) => parseChapter(u)));
     } catch (err: any) {
-      setComparison({ verdict: "unknown", similarity: 0, pairs: [], message: `Porovnání se nezdařilo: ${err?.message ?? "neznámá chyba"}` });
+      setComparison({ verdict: "uncertain", aligned: null, pairs: [], message: `Ověření se nezdařilo: ${err?.message ?? "neznámá chyba"}` });
     } finally {
       setComparing(false);
     }
@@ -229,11 +228,13 @@ export function NewDownload() {
         progress: 0,
       });
 
-      // Pořadí = pořadí katalogu; indexy se přečíslují souvisle pro vybranou množinu.
-      await db.upsertChapters(
-        project.id,
-        toInsert.map((c, i) => ({ title: c.title, url: c.url, orderIndex: i })),
-      );
+      // Ukládají se i adresy nevybraných alternativních verzí (jako vyřazené),
+      // aby šla verze později změnit a adresy zkontrolovat. Pořadí je společné.
+      const byUrl = new Map(allChapters.map((c) => [c.url, c]));
+      const rows = selection.chapters
+        .filter((c) => c.excluded || selected.has(c.url))
+        .map((c) => ({ title: byUrl.get(c.url)!.title, url: c.url, orderIndex: c.orderIndex, excluded: c.excluded }));
+      await db.upsertChapters(project.id, rows);
 
       // Stahování běží na pozadí – průběh ukazuje detail projektu.
       void downloadManager.startProject(project);
@@ -332,10 +333,14 @@ export function NewDownload() {
 
           <Card>
             <SectionTitle className="mb-3">Katalog</SectionTitle>
-            <div className="grid grid-cols-2 gap-3 text-sm">
+            <div className="grid grid-cols-3 gap-3 text-sm">
               <div className="p-3 rounded-xl bg-white/5">
-                <div className="text-white/40 text-xs">Nalezeno kapitol</div>
+                <div className="text-white/40 text-xs">Nalezeno adres</div>
                 <div className="text-xl font-bold text-white">{catalog.chapters.length}</div>
+              </div>
+              <div className="p-3 rounded-xl bg-white/5">
+                <div className="text-white/40 text-xs">Unikátních kapitol</div>
+                <div className="text-xl font-bold text-white">{analysis.uniqueCount}</div>
               </div>
               <div className="p-3 rounded-xl bg-white/5">
                 <div className="text-white/40 text-xs">Web uvádí</div>
@@ -367,48 +372,61 @@ export function NewDownload() {
             )}
           </Card>
 
-          {analysis.series.length >= 2 && (
+          {(analysis.alternatives > 0 || analysis.uncertain.length > 0) && (
             <Card>
-              <SectionTitle className="mb-2">Dvě číslovací řady</SectionTitle>
+              <SectionTitle className="mb-2">Alternativní verze kapitol</SectionTitle>
               <p className="text-xs text-white/60 mb-3">
-                Katalog obsahuje {analysis.duplicateNumbers} čísel kapitol dvakrát, pokaždé s jinou adresou. Řady se automaticky
-                nemíchají – vyberte, kterou chcete stáhnout.
-              </p>
-              <div className="space-y-2">
-                {analysis.series.map((s) => (
-                  <label key={s.id} className={`block p-3 rounded-xl border cursor-pointer ${seriesChoice === s.id ? "border-pink-500/60 bg-pink-500/10" : "border-white/10 bg-white/5"}`}>
-                    <div className="flex items-center gap-2">
-                      <input type="radio" name="series" checked={seriesChoice === s.id} onChange={() => chooseSeries(s.id as SeriesChoice)} />
-                      <span className="text-white text-sm font-semibold">{s.label}</span>
-                      <Badge variant="muted">{s.count}</Badge>
-                    </div>
-                    <div className="mt-1 text-[11px] text-white/50 truncate">{s.samples.join("  ·  ")}</div>
-                  </label>
-                ))}
-                <label className={`block p-3 rounded-xl border cursor-pointer ${seriesChoice === "all" ? "border-pink-500/60 bg-pink-500/10" : "border-white/10 bg-white/5"}`}>
-                  <div className="flex items-center gap-2">
-                    <input type="radio" name="series" checked={seriesChoice === "all"} onChange={() => chooseSeries("all")} />
-                    <span className="text-white text-sm font-semibold">Vše v pořadí katalogu</span>
-                    <Badge variant="muted">{allChapters.length}</Badge>
-                  </div>
-                  <div className="mt-1 text-[11px] text-white/50">Obě řady tak, jak je web uvádí. Kniha může obsahovat stejný text dvakrát.</div>
-                </label>
-              </div>
-              <div className="mt-3">
-                <Button variant="ghost" onClick={runComparison} disabled={comparing}>
-                  {comparing ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />} Porovnat obsah řad
-                </Button>
-                {comparison && (
-                  <div className={`mt-2 text-xs ${comparison.verdict === "identical" ? "text-green-400" : "text-amber-400"}`}>
-                    {comparison.message}
-                    {comparison.pairs.map((p) => (
-                      <div key={p.number} className="text-white/50">
-                        č. {p.number}: shoda {Math.round(p.similarity * 100)} %
-                      </div>
-                    ))}
-                  </div>
+                Katalog má {analysis.urlCount} adres, ale jen {analysis.uniqueCount} různých kapitol.
+                {analysis.altRange && (
+                  <> Kapitoly {analysis.altRange.first}–{analysis.altRange.last} ({analysis.alternatives}) existují ve dvou verzích. Verze se
+                  automaticky nemíchají – vyberte, kterou chcete. Adresy druhé verze zůstanou uložené.</>
                 )}
-              </div>
+              </p>
+              {analysis.alternatives > 0 && (
+                <div className="space-y-2">
+                  {analysis.variants.map((v) => (
+                    <label key={v.id} className={`block p-3 rounded-xl border cursor-pointer ${variant === v.id ? "border-pink-500/60 bg-pink-500/10" : "border-white/10 bg-white/5"}`}>
+                      <div className="flex items-center gap-2">
+                        <input type="radio" name="variant" checked={variant === v.id} onChange={() => chooseVariant(v.id)} />
+                        <span className="text-white text-sm font-semibold">{v.label}</span>
+                      </div>
+                      <div className="mt-1 text-[11px] text-white/50 truncate">{v.samples.join("  ·  ")}</div>
+                    </label>
+                  ))}
+                  <label className={`block p-3 rounded-xl border cursor-pointer ${variant === "all" ? "border-pink-500/60 bg-pink-500/10" : "border-white/10 bg-white/5"}`}>
+                    <div className="flex items-center gap-2">
+                      <input type="radio" name="variant" checked={variant === "all"} onChange={() => chooseVariant("all")} />
+                      <span className="text-white text-sm font-semibold">Obě verze</span>
+                      <Badge variant="muted">{allChapters.length}</Badge>
+                    </div>
+                    <div className="mt-1 text-[11px] text-white/50">Kniha bude stejnou část příběhu obsahovat dvakrát.</div>
+                  </label>
+                </div>
+              )}
+              {selection.warnings.length > 0 && (
+                <ul className="mt-3 space-y-1 text-xs text-amber-400">
+                  {selection.warnings.map((w, i) => (
+                    <li key={i} className="flex gap-2"><AlertTriangle size={14} className="flex-shrink-0 mt-0.5" /> <span>{w}</span></li>
+                  ))}
+                </ul>
+              )}
+              {analysis.alternatives > 0 && (
+                <div className="mt-3">
+                  <Button variant="ghost" onClick={runComparison} disabled={comparing}>
+                    {comparing ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />} Ověřit verze na vzorku
+                  </Button>
+                  {comparison && (
+                    <div className={`mt-2 text-xs ${comparison.verdict === "uncertain" ? "text-amber-400" : "text-green-400"}`}>
+                      {comparison.message}
+                      {comparison.pairs.map((p) => (
+                        <div key={p.number} className="text-white/50">
+                          kap. {p.number}: shoda textu {Math.round(p.similarity * 100)} %, shoda jmen a čísel {Math.round(p.affinity * 100)} %
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </Card>
           )}
 

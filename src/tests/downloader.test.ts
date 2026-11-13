@@ -15,6 +15,7 @@ type DBChapter = {
   checksum?: string;
   retryCount?: number;
   errorMessage?: string | null;
+  excluded?: boolean;
 };
 
 const chapters: DBChapter[] = [];
@@ -30,7 +31,7 @@ vi.mock("@/services/db", () => ({
     getProjects: vi.fn(async () => [{ ...projectRow }]),
     getChapters: vi.fn(async (projectId: string) => chapters.filter((c) => c.projectId === projectId).map((c) => ({ ...c }))),
     getChapterStats: vi.fn(async (projectId: string) => {
-      const cs = chapters.filter((c) => c.projectId === projectId);
+      const cs = chapters.filter((c) => c.projectId === projectId && !c.excluded);
       return {
         total: cs.length,
         downloaded: cs.filter((c) => c.status === "downloaded").length,
@@ -284,5 +285,46 @@ describe("download manager", () => {
     projectRow.status = "downloading";
     await downloadManager.recoverInterrupted();
     expect(projectRow.status).toBe("paused");
+  });
+
+  it("vyřazené alternativní verze nestahuje a do dokončení je nepočítá", async () => {
+    seed(6);
+    byId("c1").excluded = true;
+    byId("c3").excluded = true;
+    await downloadManager.startProject(project);
+    expect(parseChapter).toHaveBeenCalledTimes(4);
+    expect((parseChapter as any).mock.calls.map((c: any[]) => c[0])).toEqual([2, 4, 5, 6].map((n) => `https://example.com/${n}`));
+    expect(byId("c1").status).toBe("pending");
+    expect(projectRow.status).toBe("completed");
+    expect(projectRow.downloadedChapters).toBe(4);
+    expect(projectRow.totalChapters).toBe(4);
+  });
+
+  it("Resume po opravě projektu: už stažené soubory nechá být a stáhne jen zbytek", async () => {
+    seed(5);
+    await downloadManager.startProject(project);
+    const before = { ...files };
+    // oprava: dvě kapitoly vyřazeny, jedna označena k novému stažení
+    byId("c2").excluded = true;
+    byId("c4").status = "pending";
+    vi.clearAllMocks();
+    await downloadManager.startProject(project);
+    expect((parseChapter as any).mock.calls.map((c: any[]) => c[0])).toEqual(["https://example.com/4"]);
+    for (const id of ["c1", "c2", "c3", "c5"]) expect(files[`NovelForge/projects/p1/${id}.html`]).toBe(before[`NovelForge/projects/p1/${id}.html`]);
+    expect(projectRow.status).toBe("completed");
+  });
+
+  it("do souboru neuloží nápovědu čtečky ani blok doporučení, text příběhu ano", async () => {
+    seed(1);
+    behaviour = async () => ({
+      title: "x",
+      html: `<p>Tap the screen to use advanced tools</p>${GOOD}<p>“You'll also like the tea,” she said.</p><h4>You'll Also Like</h4><ul><li>Other Sample One</li><li>Other Sample Two</li></ul>`,
+    });
+    await downloadManager.startProject(project);
+    const file = files["NovelForge/projects/p1/c1.html"];
+    expect(file).not.toMatch(/Tap the screen|You'll Also Like|Other Sample/);
+    expect(file).toContain("A plain synthetic sentence");
+    expect(file).toMatch(/You(&#39;|&apos;|')ll also like the tea/);
+    expect(XMLValidator.validate(file)).toBe(true);
   });
 });

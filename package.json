@@ -1,7 +1,7 @@
 {
   "name": "novelforge",
   "private": true,
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "NovelForge – Web Novel to EPUB Converter for iOS (React + TypeScript + Capacitor)",
   "scripts": {
     "dev": "vite",

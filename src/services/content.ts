@@ -157,3 +157,33 @@ export function assertChapterContent(html: string): { text: string; words: numbe
   }
   return { text, words: text.split(" ").length };
 }
+
+/**
+ * Míra toho, zda dva RŮZNĚ formulované texty vyprávějí stejnou část příběhu
+ * (typicky dva překlady téže kapitoly). Porovnává opakovaná vlastní jména a
+ * čísla – ta se mezi překlady mění nejméně. Vrací 0–1.
+ *
+ * Je to odhad, ne důkaz: překlady mohou jména přepisovat různě. Výsledek se
+ * proto používá jen jako vodítko pro uživatele, nikdy k automatickému mazání.
+ */
+export function storyAffinity(a: string, b: string): number {
+  const keys = (t: string) => {
+    const counts = new Map<string, number>();
+    const sentences = t.split(/(?<=[.!?…"”])\s+/);
+    for (const s of sentences) {
+      const words = s.split(/\s+/);
+      words.forEach((w, i) => {
+        const clean = w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/['’]s$/i, "");
+        if (/^\d{2,}$/.test(clean)) counts.set(clean, (counts.get(clean) ?? 0) + 2);
+        else if (i > 0 && clean.length >= 3 && /^\p{Lu}\p{Ll}+$/u.test(clean)) counts.set(clean.toLowerCase(), (counts.get(clean.toLowerCase()) ?? 0) + 1);
+      });
+    }
+    return new Set([...counts.entries()].filter(([, c]) => c >= 2).map(([k]) => k));
+  };
+  const ka = keys(a);
+  const kb = keys(b);
+  if (ka.size < 2 || kb.size < 2) return 0;
+  let common = 0;
+  for (const k of ka) if (kb.has(k)) common++;
+  return common / Math.min(ka.size, kb.size);
+}

@@ -3,6 +3,7 @@ import { db } from "./db";
 import { parseChapter } from "./parser/registry";
 import { normalizeLanguage } from "./parser/base";
 import { assertChapterContent, contentHash, escapeXml, sanitizeToXhtml } from "./content";
+import { stripBoilerplateXhtml } from "./clean";
 import { isAbort } from "./http";
 import type { Project, Chapter, DownloadResult } from "@/types";
 
@@ -121,7 +122,7 @@ export class DownloadManager {
   async retryFailed(project: Project): Promise<void> {
     await db.init();
     const chapters = await db.getChapters(project.id);
-    for (const c of chapters.filter((c) => c.status === "failed")) {
+    for (const c of chapters.filter((c) => c.status === "failed" && !c.excluded)) {
       await db.updateChapter(c.id, { status: "pending", errorMessage: "", retryCount: 0 });
     }
     await db.updateProject(project.id, { status: "idle", failedChapters: 0 });
@@ -158,7 +159,8 @@ export class DownloadManager {
     const lang = normalizeLanguage(project.language, "en");
 
     // --- RESUME: stažené kapitoly musí opravdu existovat na disku ---
-    const chapters = await db.getChapters(project.id);
+    // Vyřazené alternativní verze se nestahují ani nepočítají.
+    const chapters = (await db.getChapters(project.id)).filter((c) => !c.excluded);
     for (const ch of chapters) {
       if (signal.aborted) break;
       if (ch.status === "downloaded") {
@@ -219,9 +221,14 @@ export class DownloadManager {
       const parsed = await parseChapter(ch.url, { signal: runSignal });
       // Obsah se ověřuje i zde, nezávisle na parseru: blokace, CAPTCHA ani
       // prázdná stránka se nikdy neuloží jako stažená kapitola.
-      const body = sanitizeToXhtml(parsed.html);
+      const body = stripBoilerplateXhtml(sanitizeToXhtml(parsed.html)).html;
       const { words } = assertChapterContent(body);
-      const title = ch.title || parsed.title;
+      // Katalog odvozený jen z počtu kapitol zná pouze "Chapter N" – skutečný
+      // název se doplní ze stránky kapitoly.
+      const placeholder = /^(chapter|kapitola)\s*\d+$/i.test(ch.title.trim());
+      const better = placeholder && parsed.title && parsed.title.trim().length > ch.title.trim().length && parsed.title.length <= 200;
+      const title = better ? parsed.title.trim() : ch.title || parsed.title;
+      if (better) ch.title = title;
       const xhtml = chapterToXhtml(title, body, project.title, project.author, lang);
       const path = await storage.chapterPath(project.id, ch.id);
       await storage.writeFile(path, xhtml);
@@ -229,6 +236,7 @@ export class DownloadManager {
       if (!size) throw new Error("Kapitolu se nepodařilo uložit do úložiště");
       await db.updateChapter(ch.id, {
         status: "downloaded",
+        title,
         filePath: path,
         fileSize: size,
         checksum: contentHash(body),

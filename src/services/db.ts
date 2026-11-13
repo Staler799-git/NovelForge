@@ -64,8 +64,9 @@ export interface Database {
   deleteProject(id: string): Promise<void>;
   getChapters(projectId: string): Promise<Chapter[]>;
   getChapter(id: string): Promise<Chapter | null>;
-  upsertChapters(projectId: string, chapters: Array<Pick<Chapter, "title" | "url" | "orderIndex">>): Promise<void>;
+  upsertChapters(projectId: string, chapters: Array<Pick<Chapter, "title" | "url" | "orderIndex"> & { excluded?: boolean }>): Promise<void>;
   updateChapter(id: string, patch: Partial<Chapter>): Promise<void>;
+  reorderChapters(patches: Array<{ id: string; orderIndex: number; excluded: boolean }>): Promise<void>;
   deleteChapters(projectId: string): Promise<void>;
   getChapterStats(projectId: string): Promise<{ total: number; downloaded: number; failed: number }>;
   close(): Promise<void>;
@@ -114,6 +115,7 @@ function rowToChapter(row: Record<string, unknown>): Chapter {
     errorMessage: row.error_message ? String(row.error_message) : undefined,
     retryCount: row.retry_count ? Number(row.retry_count) : 0,
     downloadedAt: row.downloaded_at ? String(row.downloaded_at) : undefined,
+    excluded: Number(row.excluded ?? 0) === 1,
   };
 }
 
@@ -190,6 +192,19 @@ export class CapacitorDatabase implements Database {
     await CapacitorSQLite.open({ database: DB_NAME, readonly: false });
     for (const stmt of MIGRATIONS) {
       await exec(stmt);
+    }
+    await this.addMissingColumns();
+  }
+
+  /**
+   * Doplní sloupce přidané v novějších verzích. Stávající data zůstávají –
+   * sloupec se přidá jen když v tabulce opravdu chybí.
+   */
+  private async addMissingColumns(): Promise<void> {
+    const cols = await query<{ name?: string }>("PRAGMA table_info(chapters)");
+    const names = new Set(cols.map((c) => String(c.name ?? "")));
+    if (names.size > 0 && !names.has("excluded")) {
+      await exec("ALTER TABLE chapters ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0;");
     }
   }
 
@@ -302,19 +317,19 @@ export class CapacitorDatabase implements Database {
    */
   async upsertChapters(
     projectId: string,
-    chapters: Array<Pick<Chapter, "title" | "url" | "orderIndex">>
+    chapters: Array<Pick<Chapter, "title" | "url" | "orderIndex"> & { excluded?: boolean }>
   ): Promise<void> {
     const BATCH = 80;
     for (let i = 0; i < chapters.length; i += BATCH) {
       const batch = chapters.slice(i, i + BATCH);
       const values: unknown[] = [];
       for (const ch of batch) {
-        values.push(chapterId(projectId, ch.url), projectId, ch.title, ch.url, ch.orderIndex);
+        values.push(chapterId(projectId, ch.url), projectId, ch.title, ch.url, ch.orderIndex, ch.excluded ? 1 : 0);
       }
       await run(
-        `INSERT INTO chapters (id, project_id, title, url, order_index, status)
-         VALUES ${batch.map(() => "(?,?,?,?,?,'pending')").join(",")}
-         ON CONFLICT(id) DO UPDATE SET title=excluded.title, url=excluded.url, order_index=excluded.order_index`,
+        `INSERT INTO chapters (id, project_id, title, url, order_index, excluded, status)
+         VALUES ${batch.map(() => "(?,?,?,?,?,?,'pending')").join(",")}
+         ON CONFLICT(id) DO UPDATE SET title=excluded.title, url=excluded.url, order_index=excluded.order_index, excluded=excluded.excluded`,
         values
       );
     }
@@ -338,9 +353,25 @@ export class CapacitorDatabase implements Database {
     if (patch.errorMessage !== undefined) set("error_message", patch.errorMessage ?? null);
     if (patch.retryCount !== undefined) set("retry_count", patch.retryCount);
     if (patch.downloadedAt !== undefined) set("downloaded_at", patch.downloadedAt ?? null);
+    if (patch.excluded !== undefined) set("excluded", patch.excluded ? 1 : 0);
     if (!fields.length) return;
     values.push(id);
     await run(`UPDATE chapters SET ${fields.join(", ")} WHERE id = ?`, values);
+  }
+
+  /**
+   * Hromadně změní pořadí a/nebo vyřazení kapitol (po dávkách v transakci).
+   * Tisíce jednotlivých UPDATE by znamenaly tisíce volání nativního mostu.
+   */
+  async reorderChapters(patches: Array<{ id: string; orderIndex: number; excluded: boolean }>): Promise<void> {
+    const BATCH = 200;
+    for (let i = 0; i < patches.length; i += BATCH) {
+      const set = patches.slice(i, i + BATCH).map((p) => ({
+        statement: "UPDATE chapters SET order_index = ?, excluded = ? WHERE id = ?",
+        values: [p.orderIndex, p.excluded ? 1 : 0, p.id],
+      }));
+      await CapacitorSQLite.executeSet({ database: DB_NAME, set, transaction: true });
+    }
   }
 
   async deleteChapters(projectId: string): Promise<void> {
@@ -349,7 +380,8 @@ export class CapacitorDatabase implements Database {
 
   async getChapterStats(projectId: string): Promise<{ total: number; downloaded: number; failed: number }> {
     const rows = await query(
-      `SELECT status, COUNT(*) as c FROM chapters WHERE project_id = ? GROUP BY status`,
+      // vyřazené alternativní verze se do počtů nezahrnují
+      `SELECT status, COUNT(*) as c FROM chapters WHERE project_id = ? AND COALESCE(excluded, 0) = 0 GROUP BY status`,
       [projectId]
     );
     let total = 0,

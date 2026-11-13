@@ -102,6 +102,27 @@ export const storage = {
     }
   },
 
+  backupDir(name: string): string {
+    return `${APP_DIR}/backups/${name}`;
+  },
+
+  /** Zkopíruje soubor (cílové složky se vytvoří). Existující cíl se nepřepisuje. */
+  async copyFile(from: string, to: string): Promise<void> {
+    const dir = to.split("/").slice(0, -1).join("/");
+    if (dir) await ensureDir(dir);
+    if (await this.fileExists(to)) return;
+    await Filesystem.copy({ from, to, directory: Directory.Documents, toDirectory: Directory.Documents });
+  },
+
+  async listDir(path: string): Promise<string[]> {
+    try {
+      const res = await Filesystem.readdir({ path, directory: Directory.Documents });
+      return (res.files ?? []).map((f) => f.name);
+    } catch {
+      return [];
+    }
+  },
+
   coverPath(filename: string): string {
     return `${APP_DIR}/${COVERS_DIR}/${filename}`;
   },

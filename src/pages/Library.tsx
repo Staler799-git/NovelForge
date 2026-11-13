@@ -1,38 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { db } from "@/services/db";
-import { projectStore } from "@/store";
-import type { Project } from "@/types";
+import { downloadManager } from "@/services/downloader";
+import { projectStatus } from "@/services/status";
+import { useProjects } from "@/lib/useProjects";
 import { Card, Button, Badge, ProgressBar, Cover } from "@/components/ui";
 import { formatDateShort } from "@/lib/utils";
 import { BookOpen, RefreshCw, Share2, EllipsisVertical } from "lucide-react";
 
 export function Library() {
   const navigate = useNavigate();
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  const load = useCallback(async () => {
-    try {
-      setProjects(await db.getProjects());
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    let mounted = true;
-    load();
-    const unsub = projectStore.subscribe(() => {
-      if (mounted) {
-        db.getProjects().then((ps) => setProjects(ps));
-      }
-    });
-    return () => {
-      mounted = false;
-      unsub();
-    };
-  }, [load]);
+  // Společný zdroj: stejný stav jako na obrazovce Stahování a v detailu.
+  const { projects, loading, reload: load } = useProjects();
 
   return (
     <div className="p-4 space-y-5 max-w-[700px] mx-auto">
@@ -78,12 +55,13 @@ export function Library() {
                     </div>
                     <ProgressBar value={p.progress} />
                   </div>
-                  <Badge variant={p.status === "completed" ? "ok" : "muted"}>
-                    {p.status === "completed" ? "K exportu" : "Stahování"}
-                  </Badge>
+                  {(() => {
+                    const st = projectStatus(p, downloadManager.isDownloading(p.id));
+                    return <Badge variant={st.variant}>{st.label}</Badge>;
+                  })()}
                 </div>
                 <div className="flex gap-2 mt-4">
-                  {p.status === "completed" && (
+                  {p.downloadedChapters > 0 && !downloadManager.isDownloading(p.id) && (
                     <Button onClick={(e) => { e.stopPropagation(); navigate(`/project/${p.id}/export`) }}>
                       <Share2 size={16} className="mr-1" /> Exportovat
                     </Button>

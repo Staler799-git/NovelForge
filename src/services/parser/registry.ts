@@ -2,8 +2,9 @@ import { NovelParser } from "./base";
 import type { NovelMetadata, ParserChapter, FetchOptions, CatalogResult } from "@/types";
 import { GenericNovelParser } from "./generic";
 import { WuxiaBoxParser } from "./wuxiabox";
+import { WtrLabParser } from "./wtrlab";
 
-const parsers: NovelParser[] = [new WuxiaBoxParser()];
+const parsers: NovelParser[] = [new WuxiaBoxParser(), new WtrLabParser()];
 
 export function registerParser(parser: NovelParser): void {
   parsers.push(parser);
@@ -34,5 +35,5 @@ export async function parseChapter(url: string, opts?: FetchOptions): Promise<{ 
   return getParser(url).fetchChapter(url, opts);
 }
 
-export { GenericNovelParser, WuxiaBoxParser };
+export { GenericNovelParser, WuxiaBoxParser, WtrLabParser };
 export type { NovelMetadata, ParserChapter };

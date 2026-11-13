@@ -29,6 +29,12 @@ export interface Chapter {
   errorMessage?: string;
   retryCount?: number;
   downloadedAt?: string;
+  /**
+   * true = alternativní verze kapitoly, kterou uživatel nevybral. Adresa i
+   * případný stažený soubor zůstávají, ale kapitola se nestahuje, nepočítá a
+   * neexportuje.
+   */
+  excluded?: boolean;
 }
 
 export interface Project {
