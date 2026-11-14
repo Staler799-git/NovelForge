@@ -231,3 +231,39 @@ describe("EPUB generator", () => {
     expect((await unzip(bytes)).names[0]).toBe("mimetype");
   });
 });
+
+describe("EPUB – neúplná kniha a použitý překlad", () => {
+  it("částečně stažená kniha je označená v názvu, popisu i na úvodní stránce; pořadí kapitol zůstává", async () => {
+    const chapters = Array.from({ length: 10 }, (_, i) => put(i + 1, `<p>Body of chapter ${i + 1}.</p>`));
+    const { data: bytes } = await buildEpubDetailed(project, chapters, undefined, undefined, undefined, {
+      incomplete: { included: 10, total: 3138 },
+      translations: ["AI"],
+    });
+    const zip = await JSZip.loadAsync(bytes);
+    const opf = await zip.file("OEBPS/content.opf")!.async("string");
+    expect(XMLValidator.validate(opf)).toBe(true);
+    expect(opf).toContain("(neúplné: 10 z 3138 kapitol)");
+    expect(opf).toMatch(/<dc:description>[^<]*Neúplná kniha[^<]*10 z 3138/);
+    expect(opf).toMatch(/<itemref idref="notice"\s*\/>/);
+    const notice = await zip.file("OEBPS/notice.xhtml")!.async("string");
+    expect(XMLValidator.validate(notice)).toBe(true);
+    expect(notice).toContain("10 z 3138");
+    expect(notice).toContain("Překlad: AI");
+    const order = [...opf.matchAll(/<itemref idref="([^"]+)"/g)].map((m) => m[1]);
+    expect(order.filter((id) => id !== "notice" && id !== "cover")).toHaveLength(10);
+    expect(order.indexOf("notice")).toBeLessThan(order.length - 10);
+  });
+
+  it("úplná kniha žádné upozornění neobsahuje", async () => {
+    const { data: bytes } = await buildEpubDetailed(project, [put(1, "<p>Only chapter.</p>")]);
+    const zip = await JSZip.loadAsync(bytes);
+    expect(zip.file("OEBPS/notice.xhtml")).toBeNull();
+    expect(await zip.file("OEBPS/content.opf")!.async("string")).not.toContain("neúplné");
+  });
+
+  it("smíchané překlady jsou v knize výslovně uvedené", async () => {
+    const { data: bytes } = await buildEpubDetailed(project, [put(1, "<p>One.</p>"), put(2, "<p>Two.</p>")], undefined, undefined, undefined, { translations: ["AI", "Web+"] });
+    const notice = await (await JSZip.loadAsync(bytes)).file("OEBPS/notice.xhtml")!.async("string");
+    expect(notice).toMatch(/AI, Web\+/);
+  });
+});

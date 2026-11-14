@@ -46,9 +46,9 @@ workflows:
         XCODE_SCHEME: App
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_PROJECT: ios/App/App.xcodeproj
-        # 1.2.2 = oprava pádu při pokračování stahování (WKWebView na hlavním vlákně, WTR-LAB po jedné kapitole), diagnostika.
+        # 1.3.0 = přístupová omezení zdrojů (přihlášení, ověření, 429), překladové režimy WTR-LAB, rychlostní režimy, stahování bez vykreslování kapitol.
         # Číslo buildu (CFBundleVersion) = Codemagic BUILD_NUMBER, roste s každým během.
-        APP_VERSION: 1.2.2
+        APP_VERSION: 1.3.0
 
     cache:
       cache_paths:
@@ -200,8 +200,8 @@ workflows:
             -destination "generic/platform=iOS" \
             -derivedDataPath build/derived \
             -allowProvisioningUpdates=NO \
-            MARKETING_VERSION="${APP_VERSION:-1.2.2}" \
-            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-7}" \
+            MARKETING_VERSION="${APP_VERSION:-1.3.0}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-8}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \

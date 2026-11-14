@@ -1,13 +1,16 @@
 import { storage } from "./storage";
 import { db } from "./db";
-import { parseChapter, parserInfo } from "./parser/registry";
+import { parseChapter, parserInfo, type ParserInfo } from "./parser/registry";
+import { accessKindOf, pauseMessage, statusForAccess, type AccessKind } from "./access";
+import { AdaptivePace, RunStats, basePace, normalizeSpeedMode } from "./speed";
+import { beginBackgroundWork, endBackgroundWork, unmetCondition } from "./device";
 import { diag } from "./diag";
 import { onMemoryWarning } from "./render";
 import { normalizeLanguage } from "./parser/base";
 import { assertChapterContent, contentHash, escapeXml, sanitizeToXhtml } from "./content";
 import { stripBoilerplateXhtml } from "./clean";
 import { isAbort } from "./http";
-import type { Project, Chapter, DownloadResult } from "@/types";
+import type { Project, Chapter, DownloadResult, SpeedMode } from "@/types";
 
 /** Čekání, které se při přerušení (Pause) okamžitě ukončí. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -39,6 +42,8 @@ export interface CurrentChapter {
 
 /** Kolik kapitol po sobě smí selhat, než se stahování zastaví s chybou. */
 const MAX_CONSECUTIVE_FAILURES = 5;
+/** Kolik kapitol po sobě smí web odmítnout (HTTP 403), než se stahování zastaví. */
+const MAX_CONSECUTIVE_FORBIDDEN = 2;
 /** Kolik upozornění systému na nedostatek paměti během okna vede k pozastavení. */
 const MEMORY_WARNINGS_TO_PAUSE = 2;
 const MEMORY_WINDOW_MS = 120_000;
@@ -81,6 +86,14 @@ export class DownloadManager {
   /** Časy upozornění systému na nedostatek paměti. */
   private memoryWarnings: number[] = [];
   private memoryListener: (() => void) | null = null;
+  private views = new Map<string, RunView>();
+  private appActive = true;
+  private backgroundedAt = 0;
+  private activatedAt = 0;
+  private activeWaiters: Array<() => void> = [];
+  /** Základ čekání po HTTP 429 a interval kontroly podmínek (testy je zkracují). */
+  rateLimitBackoffMs = 5000;
+  conditionPollMs = 5000;
 
   /** Systém ohlásil nedostatek paměti (volá nativní modul; testy přímo). */
   notifyMemoryWarning(): void {
@@ -237,8 +250,9 @@ export class DownloadManager {
         const size = ch.filePath ? await storage.fileSize(ch.filePath) : null;
         if (size === null || size === 0 || (ch.fileSize !== undefined && size !== ch.fileSize)) {
           this.emit({ type: "log", projectId: project.id, message: `${ch.title}: soubor chybí nebo je neúplný, stáhne se znovu` });
-          await db.updateChapter(ch.id, { status: "pending", filePath: "", fileSize: 0, checksum: "", errorMessage: "" });
+          await db.updateChapter(ch.id, { status: "pending", filePath: "", fileSize: 0, checksum: "", errorMessage: "", translationMode: "" });
           ch.status = "pending";
+          ch.translationMode = undefined;
         }
       } else if (ch.status === "failed") {
         // nový běh = nový pokus
@@ -247,14 +261,41 @@ export class DownloadManager {
       }
     }
 
-    // Souběžnost omezuje parser (WTR-LAB: 1). Rozhoduje adresa kapitol, ne jen nastavení projektu.
+    // Limity zdroje určuje parser podle adresy kapitol, ne jen nastavení projektu.
     const firstUrl = chapters.find((c) => c.status === "pending")?.url ?? chapters[0]?.url ?? project.sourceUrl ?? "";
-    opts.concurrentRequests = effectiveConcurrency(requested, firstUrl);
-    let parserName = "generic";
+    let info: ParserInfo = { name: "generic", maxConcurrency: Number.POSITIVE_INFINITY, allowFast: true, minIntervalMs: 0, translationModes: [] };
     try {
-      parserName = parserInfo(firstUrl).name;
+      info = { ...info, ...parserInfo(firstUrl) };
     } catch {
-      /* neznámá adresa */
+      /* neznámá adresa – bez omezení parseru */
+    }
+    const parserName = info.name;
+    const site = siteLabel(firstUrl);
+    const requestedSpeed = normalizeSpeedMode(project.settings?.speedMode);
+    const pace = new AdaptivePace(basePace(requestedSpeed, { concurrentRequests: requested, delayMs: opts.delayMs }, info), this.rateLimitBackoffMs);
+    opts.concurrentRequests = pace.base.concurrency;
+
+    // --- Překlad: projekt používá právě jeden; nikdy se nemíchá automaticky ---
+    let mode: string | undefined;
+    if (info.translationModes.length > 0) {
+      const known = (m: string | undefined) => (m && info.translationModes.some((x) => x.id === m) ? m : undefined);
+      mode = known(project.settings?.translationMode);
+      if (!mode) {
+        // Projekt ze starší verze: ta stahovala jediný (výchozí) překlad.
+        mode = known(info.legacyTranslationMode) ?? info.translationModes[0].id;
+        await db.updateProject(project.id, { settings: { concurrentRequests: requested, delayMs: opts.delayMs, maxRetries: opts.maxRetries, translationMode: mode } });
+        this.emit({ type: "log", projectId: project.id, message: `Projekt neměl evidovaný překlad – nastaven ${modeName(info, mode)} (ten stahovaly starší verze).` });
+      }
+      // Kapitoly stažené starší verzí nemají překlad evidovaný – doplní se výchozí.
+      const legacy = known(info.legacyTranslationMode);
+      if (legacy) {
+        for (const ch of chapters) {
+          if (ch.status === "downloaded" && !ch.translationMode) {
+            await db.updateChapter(ch.id, { translationMode: legacy });
+            ch.translationMode = legacy;
+          }
+        }
+      }
     }
 
     const total = chapters.length;
@@ -291,30 +332,78 @@ export class DownloadManager {
     }
 
     if (queue.length === 0) {
-      await saveProgress({ status: "completed", progress: 100 });
+      await saveProgress({ status: "completed", progress: 100, accessKind: "", accessMessage: "" });
       this.emit({ type: "log", projectId: project.id, message: "Všechny kapitoly jsou stažené." });
       this.emit({ type: "project-end", projectId: project.id, ok: true });
       return;
     }
 
-    await saveProgress({ status: "downloading" });
+    const stats = new RunStats();
+    const view: RunView = {
+      speedMode: requestedSpeed,
+      effectiveSpeedMode: pace.base.mode,
+      concurrency: pace.concurrency,
+      delayMs: pace.delayMs,
+      translationMode: mode,
+      translationLabel: mode ? modeName(info, mode) : undefined,
+      perMinute: 0,
+      avgChapterMs: 0,
+      etaMs: null,
+      waiting: null,
+      slowdowns: 0,
+    };
+    this.views.set(project.id, view);
+    const refreshView = () => {
+      view.concurrency = pace.concurrency;
+      view.delayMs = pace.delayMs;
+      view.perMinute = stats.perMinute();
+      view.avgChapterMs = stats.avgChapterMs;
+      view.etaMs = stats.etaMs(total - downloaded - failed);
+      view.slowdowns = pace.slowdowns;
+    };
+
+    await saveProgress({ status: "downloading", accessKind: "", accessMessage: "" });
     this.emit({ type: "project-start", projectId: project.id });
     this.emit({ type: "log", projectId: project.id, message: `Stahuji ${queue.length} kapitol (${downloaded} už hotovo).` });
-    if (opts.concurrentRequests < requested) {
-      this.emit({ type: "log", projectId: project.id, message: `Tento web se stahuje po ${opts.concurrentRequests === 1 ? "jedné kapitole" : `${opts.concurrentRequests} kapitolách`} (nastaveno ${requested}) – kvůli stabilitě.` });
+    if (pace.base.concurrency < requested && requestedSpeed !== "eco") {
+      this.emit({ type: "log", projectId: project.id, message: `Tento web se stahuje po ${pace.base.concurrency === 1 ? "jedné kapitole" : `${pace.base.concurrency} kapitolách`} (nastaveno ${requested}) – kvůli stabilitě.` });
     }
-    diag.log("queue", { project: project.id, parser: parserName, total, downloaded, pending: queue.length, concurrency: opts.concurrentRequests, requested, delayMs: opts.delayMs });
+    if (requestedSpeed === "fast" && pace.base.mode !== "fast") {
+      this.emit({ type: "log", projectId: project.id, message: "Rychlý režim tento web nedovoluje – použije se vyvážený." });
+    }
+    if (mode) this.emit({ type: "log", projectId: project.id, message: `Překlad: ${modeName(info, mode)}.` });
+    diag.log("queue", {
+      project: project.id, parser: parserName, total, downloaded, pending: queue.length,
+      concurrency: pace.concurrency, requested, delayMs: pace.delayMs, speed: pace.base.mode, translation: mode,
+    });
 
     let consecutiveFailures = 0;
+    let consecutiveForbidden = 0;
     let successesThisRun = 0;
     let fatal: string | null = null;
+    let fatalStatus: Project["status"] = "paused";
+    let fatalKind = "";
     const inner = new AbortController();
     const stop = () => inner.abort();
     signal.addEventListener("abort", stop, { once: true });
     const runSignal = inner.signal;
+    const halt = (message: string, status: Project["status"] = "paused", kind = "") => {
+      if (!fatal) {
+        fatal = message;
+        fatalStatus = status;
+        fatalKind = kind;
+      }
+      stop();
+    };
 
-    const downloadOne = async (ch: Chapter): Promise<DownloadResult> => {
-      const parsed = await parseChapter(ch.url, { signal: runSignal });
+    const downloadOne = async (ch: Chapter): Promise<DownloadResult & { steps: StepTimes }> => {
+      const t0 = Date.now();
+      const parsed = await parseChapter(ch.url, { signal: runSignal, translationMode: mode });
+      // Projekt eviduje jeden překlad – text v jiném se nikdy neuloží.
+      if (mode && parsed.translationMode && parsed.translationMode !== mode) {
+        throw Object.assign(new Error(`Zdroj vrátil jiný překlad (${parsed.translationMode}), než projekt používá (${mode}). Kapitola se neuložila.`), { retryable: false, kind: "parser" });
+      }
+      const t1 = Date.now();
       // Obsah se ověřuje i zde, nezávisle na parseru: blokace, CAPTCHA ani
       // prázdná stránka se nikdy neuloží jako stažená kapitola.
       const body = stripBoilerplateXhtml(sanitizeToXhtml(parsed.html)).html;
@@ -326,10 +415,18 @@ export class DownloadManager {
       const title = better ? parsed.title.trim() : ch.title || parsed.title;
       if (better) ch.title = title;
       const xhtml = chapterToXhtml(title, body, project.title, project.author, lang);
-      const path = await storage.chapterPath(project.id, ch.id);
-      await storage.writeFile(path, xhtml);
-      const size = await storage.fileSize(path);
-      if (!size) throw new Error("Kapitolu se nepodařilo uložit do úložiště");
+      const t2 = Date.now();
+      let path: string;
+      let size: number | null;
+      try {
+        path = await storage.chapterPath(project.id, ch.id);
+        await storage.writeFile(path, xhtml);
+        size = await storage.fileSize(path);
+      } catch (err) {
+        throw Object.assign(new Error(`Kapitolu se nepodařilo uložit do úložiště: ${errorMessage(err)}`), { kind: "storage", retryable: false });
+      }
+      if (!size) throw Object.assign(new Error("Kapitolu se nepodařilo uložit do úložiště"), { kind: "storage", retryable: false });
+      const t3 = Date.now();
       await db.updateChapter(ch.id, {
         status: "downloaded",
         title,
@@ -338,9 +435,12 @@ export class DownloadManager {
         checksum: contentHash(body),
         wordCount: words,
         errorMessage: "",
+        errorKind: "",
+        translationMode: mode ?? "",
         downloadedAt: new Date().toISOString(),
       });
-      return { chapterId: ch.id, success: true, filePath: path, bytes: size };
+      const t4 = Date.now();
+      return { chapterId: ch.id, success: true, filePath: path, bytes: size, steps: { fetch: t1 - t0, clean: t2 - t1, write: t3 - t2, db: t4 - t3 } };
     };
 
     const processOne = async (ch: Chapter, index: number): Promise<void> => {
@@ -349,8 +449,11 @@ export class DownloadManager {
       this.emit({ type: "chapter-start", projectId: project.id, chapterId: ch.id, title: ch.title, index, total });
 
       let result: DownloadResult = { chapterId: ch.id, success: false, error: "Nespuštěno" };
+      let kind: AccessKind | null = null;
+      let steps: StepTimes = { fetch: 0, clean: 0, write: 0, db: 0 };
       let attempts = 0;
-      const endChapter = diag.begin("chapter", { project: project.id, parser: parserName, no: ch.url.match(/chapter[-_/](\d+)/i)?.[1] ?? String(ch.orderIndex + 1), index, url: ch.url });
+      const startedAt = Date.now();
+      const endChapter = diag.begin("chapter", { project: project.id, parser: parserName, no: ch.url.match(/chapter[-_/](\d+)/i)?.[1] ?? String(ch.orderIndex + 1), index, translation: mode, url: ch.url });
       // Dokud v tomto běhu nic neprošlo, zkoušíme každou kapitolu jen krátce –
       // když web blokuje vše, dozví se to uživatel za pár sekund, ne za minuty.
       const maxRetries = () => (successesThisRun === 0 ? Math.min(1, opts.maxRetries) : opts.maxRetries);
@@ -358,26 +461,71 @@ export class DownloadManager {
       for (;;) {
         attempts++;
         let retryable = true;
+        const attemptStart = Date.now();
         try {
-          result = await downloadOne(ch);
+          const r = await downloadOne(ch);
+          steps = r.steps;
+          result = r;
+          kind = null;
         } catch (err: any) {
           if (isAbort(err) || runSignal.aborted) {
             endChapter({ ok: false, error: "pozastaveno" });
             return; // pozastaveno – kapitola zůstává ve frontě
           }
+          kind = accessKindOf(err);
+          const message = errorMessage(err);
           if (err?.critical === true) {
             // Kritická chyba (pád vykreslovacího procesu, nedostatek paměti): nepokračovat.
-            // Kapitola zůstává ve frontě; stažené kapitoly se nemění.
-            endChapter({ ok: false, critical: true, error: errorMessage(err) });
-            if (!fatal) fatal = `Stahování pozastaveno kvůli kritické chybě: ${errorMessage(err)}. Stažené kapitoly zůstaly uložené; pokračujte tlačítkem Pokračovat.`;
-            stop();
+            endChapter({ ok: false, critical: true, error: message });
+            halt(`Stahování pozastaveno kvůli kritické chybě: ${message}. Stažené kapitoly zůstaly uložené; pokračujte tlačítkem Pokračovat.`);
             return;
           }
+          // Aplikace byla na pozadí (iOS přeruší síť) – není to chyba kapitoly.
+          if (this.interruptedByBackground(attemptStart)) {
+            attempts--;
+            diag.log("chapter-retry-after-background", { project: project.id, error: message });
+            await this.waitUntilActive(runSignal);
+            if (runSignal.aborted) {
+              endChapter({ ok: false, error: "pozastaveno" });
+              return;
+            }
+            continue;
+          }
+          if (err?.stopSource === true || kind === "storage") {
+            // Přístupová překážka nebo chyba úložiště: kapitola zůstává ve frontě
+            // a na zdroj se neposílají žádné další požadavky.
+            await db.updateChapter(ch.id, { errorMessage: message, errorKind: kind ?? "" });
+            endChapter({ ok: false, blocked: kind ?? "stop", error: message });
+            if (kind === "storage") halt(`Stahování pozastaveno: ${message}. Zkontrolujte volné místo v zařízení.`, "paused", "storage");
+            else halt(pauseMessage(site, kind!, message), statusForAccess(kind!), kind!);
+            return;
+          }
+          if (kind === "rate-limited") {
+            const wait = pace.onRateLimit(err?.retryAfterMs);
+            refreshView();
+            if (wait === null) {
+              await db.updateChapter(ch.id, { errorMessage: message, errorKind: kind });
+              endChapter({ ok: false, blocked: kind, error: message });
+              halt(pauseMessage(site, kind, message), "rate-limited", kind);
+              return;
+            }
+            attempts--;
+            this.emit({ type: "log", projectId: project.id, message: `${message} Čekám ${Math.ceil(wait / 1000)} s a zpomaluji.` });
+            diag.log("rate-limit-wait", { project: project.id, waitMs: wait, retryAfterMs: err?.retryAfterMs, delayMs: pace.delayMs });
+            view.waiting = "Web omezil počet požadavků – čeká se";
+            await sleep(wait, runSignal);
+            view.waiting = null;
+            if (runSignal.aborted) {
+              endChapter({ ok: false, error: "pozastaveno" });
+              return;
+            }
+            continue;
+          }
           retryable = err?.retryable !== false;
-          result = { chapterId: ch.id, success: false, error: errorMessage(err) };
+          result = { chapterId: ch.id, success: false, error: message };
         }
         if (result.success || !retryable || attempts > maxRetries()) break;
-        await db.updateChapter(ch.id, { retryCount: attempts, errorMessage: result.error });
+        await db.updateChapter(ch.id, { retryCount: attempts, errorMessage: result.error, errorKind: kind ?? "" });
         this.emit({ type: "log", projectId: project.id, message: `${ch.title}: ${result.error} – opakuji (${attempts}/${maxRetries()})` });
         await sleep(Math.min(10000, Math.max(500, opts.delayMs) * attempts), runSignal);
         if (runSignal.aborted) {
@@ -385,41 +533,92 @@ export class DownloadManager {
           return;
         }
       }
-      endChapter({ ok: result.success, attempts, bytes: result.bytes, error: result.success ? undefined : result.error });
+      endChapter({
+        ok: result.success, attempts, bytes: result.bytes,
+        fetchMs: result.success ? steps.fetch : undefined, cleanMs: result.success ? steps.clean : undefined,
+        writeMs: result.success ? steps.write : undefined, dbMs: result.success ? steps.db : undefined,
+        kind: result.success ? undefined : (kind ?? undefined), error: result.success ? undefined : result.error,
+      });
 
       if (result.success) {
         downloaded++;
         successesThisRun++;
         consecutiveFailures = 0;
+        consecutiveForbidden = 0;
+        pace.onSuccess();
+        stats.record(Date.now() - startedAt, steps);
+        refreshView();
         await saveProgress({ lastDownloadedChapter: ch.title });
       } else {
         failed++;
         consecutiveFailures++;
-        await db.updateChapter(ch.id, { status: "failed", errorMessage: result.error, retryCount: attempts - 1 });
+        consecutiveForbidden = kind === "forbidden" ? consecutiveForbidden + 1 : 0;
+        await db.updateChapter(ch.id, { status: "failed", errorMessage: result.error, errorKind: kind ?? "", retryCount: attempts - 1 });
         this.emit({ type: "log", projectId: project.id, message: `Chyba – ${ch.title}: ${result.error}` });
+        refreshView();
         await saveProgress();
-        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES && !fatal) {
-          fatal = `Stahování zastaveno: ${consecutiveFailures} kapitol po sobě selhalo. Důvod: ${result.error}`;
-          stop();
+        if (consecutiveForbidden >= MAX_CONSECUTIVE_FORBIDDEN) {
+          halt(pauseMessage(site, "forbidden", result.error ?? ""), "paused", "forbidden");
+        } else if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          halt(`Stahování zastaveno: ${consecutiveFailures} kapitol po sobě selhalo. Důvod: ${result.error}`, "paused", kind ?? "");
         }
       }
       this.emit({ type: "chapter-end", projectId: project.id, chapterId: ch.id, result });
     };
 
+    /** Podmínky projektu (Wi-Fi, nabíjení) a běh na pozadí – čeká, dokud nejsou splněné. */
+    const waitForConditions = async (): Promise<void> => {
+      for (;;) {
+        if (runSignal.aborted) return;
+        if (!this.appActive) {
+          view.waiting = "Aplikace je na pozadí – iOS stahování pozastavil";
+          this.emit({ type: "progress", projectId: project.id, progress: pct(), downloaded, failed, total });
+          await this.waitUntilActive(runSignal);
+          view.waiting = null;
+          continue;
+        }
+        let reason: string | null = null;
+        try {
+          reason = await unmetCondition(project.settings);
+        } catch {
+          reason = null;
+        }
+        if (!reason) {
+          if (view.waiting) {
+            view.waiting = null;
+            this.emit({ type: "log", projectId: project.id, message: "Podmínky splněny – pokračuji." });
+          }
+          return;
+        }
+        if (view.waiting !== reason) {
+          view.waiting = reason;
+          this.emit({ type: "log", projectId: project.id, message: `${reason} – čekám.` });
+          diag.log("waiting-condition", { project: project.id, reason });
+          this.emit({ type: "progress", projectId: project.id, progress: pct(), downloaded, failed, total });
+        }
+        await sleep(this.conditionPollMs, runSignal);
+      }
+    };
+
     let next = 0;
     const workers: Promise<void>[] = [];
-    for (let w = 0; w < Math.min(opts.concurrentRequests, queue.length); w++) {
+    const maxWorkers = Math.min(pace.base.concurrency, queue.length);
+    for (let w = 0; w < maxWorkers; w++) {
       workers.push(
         (async () => {
           // rozfázování startu, aby požadavky nepřišly ve stejný okamžik
-          if (w > 0 && opts.delayMs > 0) await sleep((opts.delayMs / opts.concurrentRequests) * w, runSignal);
+          if (w > 0 && pace.delayMs > 0) await sleep((pace.delayMs / maxWorkers) * w, runSignal);
           let seenWarnings = this.recentMemoryWarnings();
           while (!runSignal.aborted) {
+            // Adaptivní souběžnost: po zpomalení pracují jen první pracovníci.
+            if (w >= pace.concurrency) {
+              await sleep(1000, runSignal);
+              continue;
+            }
             // Kontrola paměti před každou kapitolou.
             const warnings = this.recentMemoryWarnings();
             if (warnings >= MEMORY_WARNINGS_TO_PAUSE) {
-              if (!fatal) fatal = "Stahování pozastaveno: systém opakovaně hlásí nedostatek paměti. Stažené kapitoly zůstaly uložené; zavřete jiné aplikace a pokračujte tlačítkem Pokračovat.";
-              stop();
+              halt("Stahování pozastaveno: systém opakovaně hlásí nedostatek paměti. Stažené kapitoly zůstaly uložené; zavřete jiné aplikace a pokračujte tlačítkem Pokračovat.");
               break;
             }
             if (warnings > seenWarnings) {
@@ -428,19 +627,23 @@ export class DownloadManager {
               if (runSignal.aborted) break;
             }
             seenWarnings = warnings;
+            await waitForConditions();
+            if (runSignal.aborted) break;
             const index = next++;
             if (index >= queue.length) break;
+            const started = Date.now();
             try {
               await processOne(queue[index], index);
             } catch (err) {
               // Chyba mimo stažení kapitoly (databáze, úložiště): ostatní pracovníci se zastaví
               // a běh skončí řízeně pozastavením – žádná neobsloužená výjimka.
               diag.log("worker-error", { project: project.id, error: errorMessage(err) });
-              if (!fatal) fatal = `Stahování pozastaveno: ${errorMessage(err)}`;
-              stop();
+              halt(`Stahování pozastaveno: ${errorMessage(err)}`);
               break;
             }
-            if (opts.delayMs > 0) await sleep(opts.delayMs, runSignal);
+            // Odstup se počítá od ZAČÁTKU kapitoly – doba požadavku se nepřičítá navíc.
+            const wait = pace.delayMs - (Date.now() - started);
+            if (wait > 0) await sleep(wait, runSignal);
           }
         })(),
       );
@@ -450,12 +653,23 @@ export class DownloadManager {
     } finally {
       signal.removeEventListener("abort", stop);
       this.current.delete(project.id);
+      view.waiting = null;
+    }
+
+    if (stats.completed > 0) {
+      const n = stats.completed;
+      diag.log("run-timing", {
+        project: project.id, chapters: n, perMinute: Math.round(stats.perMinute() * 10) / 10, avgChapterMs: Math.round(stats.avgChapterMs),
+        avgFetchMs: Math.round(stats.steps.fetch / n), avgCleanMs: Math.round(stats.steps.clean / n),
+        avgWriteMs: Math.round(stats.steps.write / n), avgDbMs: Math.round(stats.steps.db / n),
+        delayMs: pace.delayMs, concurrency: pace.concurrency, slowdowns: pace.slowdowns,
+      });
     }
 
     if (fatal) {
       this.lastErrors.set(project.id, fatal);
-      diag.log("run-paused", { project: project.id, reason: fatal, downloaded, total });
-      await saveProgress({ status: "paused" });
+      diag.log("run-paused", { project: project.id, reason: fatal, status: fatalStatus, kind: fatalKind, downloaded, total });
+      await saveProgress({ status: fatalStatus, accessKind: fatalKind, accessMessage: fatal });
       this.emit({ type: "log", projectId: project.id, message: fatal });
       this.emit({ type: "project-end", projectId: project.id, ok: false, error: fatal });
       return;
@@ -469,18 +683,99 @@ export class DownloadManager {
     }
 
     // Projekt je "dokončený" jen tehdy, když jsou stažené VŠECHNY kapitoly.
-    const stats = await db.getChapterStats(project.id);
-    downloaded = stats.downloaded;
-    failed = stats.failed;
-    const allDone = stats.downloaded === stats.total;
+    const final = await db.getChapterStats(project.id);
+    downloaded = final.downloaded;
+    failed = final.failed;
+    const allDone = final.downloaded === final.total;
     await saveProgress({ status: allDone ? "completed" : failed > 0 ? "failed" : "paused" });
     const summary = allDone
-      ? `Hotovo: staženo všech ${stats.total} kapitol.`
-      : `Dokončeno s chybami: ${stats.downloaded}/${stats.total} kapitol, ${failed} selhalo.`;
+      ? `Hotovo: staženo všech ${final.total} kapitol.`
+      : `Dokončeno s chybami: ${final.downloaded}/${final.total} kapitol, ${failed} selhalo.`;
     if (!allDone) this.lastErrors.set(project.id, summary);
     this.emit({ type: "log", projectId: project.id, message: summary });
     this.emit({ type: "project-end", projectId: project.id, ok: allDone, error: allDone ? undefined : summary });
   }
+
+  // --- Běh na pozadí ---------------------------------------------------------
+
+  /**
+   * Aplikace přešla na pozadí / vrátila se. iOS po přechodu na pozadí běh
+   * JavaScriptu brzy pozastaví; rozpracovaná kapitola se zkusí dokončit
+   * (krátký čas od systému), další se nezačínají. Po návratu se pokračuje samo.
+   */
+  setAppActive(active: boolean): void {
+    if (this.appActive === active) return;
+    this.appActive = active;
+    if (active) {
+      this.activatedAt = Date.now();
+      void endBackgroundWork();
+      const waiters = this.activeWaiters;
+      this.activeWaiters = [];
+      waiters.forEach((w) => w());
+    } else {
+      this.backgroundedAt = Date.now();
+      if (this.runningProjects.size > 0) void beginBackgroundWork();
+    }
+  }
+
+  isAppActive(): boolean {
+    return this.appActive;
+  }
+
+  private waitUntilActive(signal: AbortSignal): Promise<void> {
+    if (this.appActive || signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => {
+        signal.removeEventListener("abort", done);
+        resolve();
+      };
+      this.activeWaiters.push(done);
+      signal.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  /** Selhal pokus proto, že aplikace mezitím byla na pozadí (nebo se právě vrátila)? */
+  private interruptedByBackground(attemptStart: number): boolean {
+    if (!this.appActive) return true;
+    return this.backgroundedAt >= attemptStart || (this.activatedAt >= attemptStart && Date.now() - this.activatedAt < 5000);
+  }
+
+  /** Živé údaje o běhu (rychlost, překlad, čekání) pro obrazovku Stahování. */
+  getRunView(projectId: string): RunView | undefined {
+    return this.runningProjects.has(projectId) ? this.views.get(projectId) : undefined;
+  }
+}
+
+interface StepTimes {
+  fetch: number;
+  clean: number;
+  write: number;
+  db: number;
+}
+
+export interface RunView {
+  speedMode: SpeedMode;
+  effectiveSpeedMode: SpeedMode;
+  concurrency: number;
+  delayMs: number;
+  translationMode?: string;
+  translationLabel?: string;
+  perMinute: number;
+  avgChapterMs: number;
+  etaMs: number | null;
+  /** Důvod, proč se právě čeká (podmínky, pozadí, omezení webu), nebo null. */
+  waiting: string | null;
+  slowdowns: number;
+}
+
+function modeName(info: ParserInfo, mode: string): string {
+  return info.translationModes.find((m) => m.id === mode)?.label ?? mode;
+}
+
+function siteLabel(url: string): string {
+  const host = safeHost(url).replace(/^www\./, "");
+  if (/(^|\.)wtr-lab\.com$/i.test(host)) return "WTR-LAB";
+  return host || "Web";
 }
 
 /** Uložený soubor kapitoly: well-formed XHTML s jazykem projektu. */

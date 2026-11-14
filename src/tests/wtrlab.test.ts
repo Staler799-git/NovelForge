@@ -95,7 +95,6 @@ function reset() {
   const parser = getParser(NOVEL) as WtrLabParser;
   parser.catalogDelayMs = 0;
   parser.chapterIntervalMs = 0;
-  parser.renderDelayMs = 0;
   (parser as any).preferredMode = null;
 }
 beforeEach(reset);
@@ -402,36 +401,12 @@ describe("kontrola pokrytí číselného rozsahu", () => {
 });
 
 describe("WTR-LAB – text kapitol", () => {
-  it("první tři kapitoly z dat stránky: správný název, celý text, platné XHTML", async () => {
-    for (const n of [1, 2, 3]) pages[`${NOVEL}/chapter-${n}`] = { data: shell("", chapterData(n)) };
-    for (const n of [1, 2, 3]) {
-      const ch = await getParser(CH1).fetchChapter(`${NOVEL}/chapter-${n}`);
-      expect(ch.title).toBe(`Sample Heading ${n}`);
-      const text = htmlToText(ch.html);
-      for (const i of [1, 2, 3, 4]) expect(text).toContain(para(n, i));
-      expect(text).not.toMatch(/WTR-LAB|v1\.13\.17|Login|Privacy/);
-      expect(XMLValidator.validate(chapterToXhtml(ch.title, ch.html, "Sample Longevity Club", "Wo Xing Yu", "en"))).toBe(true);
-    }
-  });
-
-  it("text až po vykreslení: vezme jen tělo kapitoly, bez ovládání čtečky a doporučení", async () => {
-    pages[CH1] = { data: shell("") };
-    rendered[CH1] = shell(`<main><h1 class="chapter-title">Sample Heading 1</h1>
-      <div class="chapter-tools"><button>A+</button><a href="${NOVEL}/chapter-2">Next</a></div>
-      <div class="chapter-body">${[1, 2, 3, 4].map((i) => `<p>${para(1, i)}</p>`).join("")}<p>“Žluťoučký kůň,” řekl 我姓俞.</p></div>
-      <section class="recommend"><h4>You'll Also Like</h4><a href="/en/novel/1/a">Other Sample One</a><a href="/en/novel/2/b">Other Sample Two</a></section></main>`);
-    const ch = await getParser(CH1).fetchChapter(CH1);
-    const text = htmlToText(ch.html);
-    expect(ch.title).toBe("Sample Heading 1");
-    expect(text).toContain(para(1, 4));
-    expect(text).toContain("“Žluťoučký kůň,” řekl 我姓俞.");
-    expect(text).not.toMatch(/Also Like|Other Sample|Next|A\+|v1\.13\.17/);
-    expect(text.startsWith("Synthetic paragraph 1")).toBe(true);
-  });
-
-  it("když web text nevydá (přihlášení, zámek), řekne to a nic si nevymýšlí", async () => {
-    pages[CH1] = { data: shell("<main><h1>Sample Heading 1</h1><p>Please log in to continue reading.</p></main>") };
-    await expect(getParser(CH1).fetchChapter(CH1)).rejects.toThrow(/nepodařilo načíst|přihlášení/);
+  it("stránka kapitoly se nevykresluje: z vykreslené stránky nejde poznat překlad", async () => {
+    pages[CH1] = { data: shell("", chapterData(1)) };
+    rendered[CH1] = shell(`<main><div class="chapter-body">${[1, 2, 3, 4].map((i) => `<p>${para(1, i)}</p>`).join("")}</div></main>`);
+    await expect(getParser(CH1).fetchChapter(CH1)).rejects.toMatchObject({ kind: "unavailable" });
+    expect(renders).toEqual([]);
+    expect(requests).toEqual([]);
   });
 
   it("adresa novely není kapitola", async () => {
@@ -473,39 +448,37 @@ describe("WTR-LAB – text kapitol z rozhraní čtečky", () => {
     expect(XMLValidator.validate(`<div>${ch.html}</div>`)).toBe(true);
   });
 
-  it("zamčený překlad AI => použije se Web a parser u něj zůstane", async () => {
+  it("zamčený překlad AI se NEnahradí jiným: žádný automatický přechod na Web", async () => {
     postHandler = (b) => (b.translate === "ai" ? { data: { code: "CHAPTER_LOCKED" } } : { data: { success: true, data: { data: { title: `Web Heading ${b.chapter_no}`, body: body(b.chapter_no) } } } });
-    expect((await getParser(NOVEL).fetchChapter(chUrl(1))).title).toBe("Web Heading 1");
-    expect(posts.map((p) => p.body.translate)).toEqual(["ai", "web"]);
+    await expect(getParser(NOVEL).fetchChapter(chUrl(11))).rejects.toMatchObject({ kind: "login-required", stopSource: true });
+    expect(posts.map((p) => p.body.translate)).toEqual(["ai"]);
+    // výslovně zvolený Web se stáhne a ohlásí svůj režim
     posts.length = 0;
-    await getParser(NOVEL).fetchChapter(chUrl(2));
+    const ch = await getParser(NOVEL).fetchChapter(chUrl(11), { translationMode: "web" });
+    expect(ch).toMatchObject({ title: "Web Heading 11", translationMode: "web" });
     expect(posts.map((p) => p.body.translate)).toEqual(["web"]);
   });
 
-  it("web žádá ověření Turnstile => nic se neobchází; text se vezme z vykreslené stránky", async () => {
+  it("web žádá ověření Turnstile => nic se neobchází, nic se nevykresluje, další režim se nezkouší", async () => {
     postHandler = () => ({ data: { requireTurnstile: true } });
-    pages[CH1] = { data: shell("") };
-    rendered[CH1] = shell(`<main><h1 class="chapter-title">Sample Heading 1</h1><div class="chapter-body">${body(1).map((p) => `<p>${p}</p>`).join("")}</div></main>`);
-    const ch = await getParser(NOVEL).fetchChapter(CH1);
-    expect(htmlToText(ch.html)).toContain(para(1, 3));
-    expect(posts).toHaveLength(1); // po žádosti o ověření se další režim nezkouší
-
-    delete rendered[CH1];
-    await expect(getParser(NOVEL).fetchChapter(CH1)).rejects.toThrow(/Text kapitoly 1 se na WTR-LAB nepodařilo načíst.*Rozhraní čtečky: ai: web vyžaduje ověření \(Turnstile\)/);
+    rendered[CH1] = shell(`<main><div class="chapter-body">${body(1).map((p) => `<p>${p}</p>`).join("")}</div></main>`);
+    await expect(getParser(NOVEL).fetchChapter(CH1)).rejects.toMatchObject({ kind: "challenge", stopSource: true, message: expect.stringMatching(/Turnstile.*neobchází/) });
+    expect(posts).toHaveLength(1);
+    expect(renders).toEqual([]);
   });
 
   it("chráněný (šifrovaný) obsah nedešifruje", async () => {
     postHandler = () => ({ data: { success: true, data: { data: { title: "x", body: "arr:AAAA:BBBB:CCCC" } } } });
-    pages[CH1] = { data: shell("") };
-    await expect(getParser(NOVEL).fetchChapter(CH1)).rejects.toThrow(/text je v podobě, kterou aplikace nečte \(chráněný obsah\)/);
+    await expect(getParser(NOVEL).fetchChapter(CH1, { translationMode: "web" })).rejects.toMatchObject({ kind: "mode-unsupported", stopSource: true, message: expect.stringMatching(/Překlad Web .*chráněné podobě.*nedešifruje/) });
+    postHandler = () => ({ data: { success: true, data: { data: { title: "x", body: ["str:AAAA:BBBB", "str:CCCC"] } } } });
+    await expect(getParser(NOVEL).fetchChapter(CH1, { translationMode: "webplus" })).rejects.toMatchObject({ kind: "mode-unsupported" });
   });
 
   it("nevyplněné zástupné značky ani obsah z cizí adresy neuloží", async () => {
-    pages[CH1] = { data: shell("") };
     postHandler = () => ({ data: { success: true, data: { data: { title: "x", body: ["※5⛬ walked. " + para(1, 1), ...body(1)], glossary_data: { terms: [["Only"]] } } } } });
     await expect(getParser(NOVEL).fetchChapter(CH1)).rejects.toThrow(/nevyplněné zástupné značky/);
     postHandler = () => ({ data: { success: true, content_url: "https://evil.example.org/x.json" } });
-    await expect(getParser(NOVEL).fetchChapter(CH1)).rejects.toThrow(/obsah odkazuje mimo web/);
+    await expect(getParser(NOVEL).fetchChapter(CH1)).rejects.toThrow(/obsah kapitoly odkazuje mimo web/);
     expect(requests.some((u) => u.includes("evil.example.org"))).toBe(false);
   });
 

@@ -1,6 +1,6 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { parseMetadata, parseCatalog, parseChapter } from "@/services/parser/registry";
+import { parseMetadata, parseCatalog, parseChapter, parserInfo } from "@/services/parser/registry";
 import { db } from "@/services/db";
 import { downloadManager } from "@/services/downloader";
 import { storage } from "@/services/storage";
@@ -34,6 +34,7 @@ export function NewDownload() {
   const [phase, setPhase] = useState("");
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [translation, setTranslation] = useState("");
   const [cover, setCover] = useState<CoverData | null>(null);
   const [coverPath, setCoverPath] = useState<string | null>(null);
   const [coverNote, setCoverNote] = useState("");
@@ -193,6 +194,16 @@ export function NewDownload() {
     setCoverNote("");
   };
 
+  const sourceInfo = useMemo(() => {
+    try {
+      return meta?.sourceUrl ? parserInfo(meta.sourceUrl) : null;
+    } catch {
+      return null;
+    }
+  }, [meta?.sourceUrl]);
+  const translationModes = sourceInfo?.translationModes ?? [];
+  const defaultTranslation = sourceInfo?.legacyTranslationMode ?? "";
+
   const startDownload = async () => {
     if (!meta || starting) return;
     const toInsert = chapters.filter((c) => selected.has(c.url));
@@ -232,6 +243,7 @@ export function NewDownload() {
         failedChapters: 0,
         status: "idle",
         progress: 0,
+        ...(translationModes.length ? { settings: { concurrentRequests: 3, delayMs: 1500, maxRetries: 5, translationMode: translation || defaultTranslation } } : {}),
       });
 
       // Ukládají se i adresy nevybraných alternativních verzí (jako vyřazené),
@@ -500,6 +512,26 @@ export function NewDownload() {
               )}
             </div>
           </Card>
+
+          {translationModes.length > 0 && (
+            <Card>
+              <SectionTitle>Překlad</SectionTitle>
+              <select
+                className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-sm text-white"
+                value={translation || defaultTranslation}
+                onChange={(e) => setTranslation(e.target.value)}
+                aria-label="Překlad"
+              >
+                {translationModes.map((m) => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+              </select>
+              <div className="mt-2 text-xs text-white/50 leading-relaxed">
+                Celá kniha se stahuje v jednom překladu; aplikace ho sama nikdy nezmění. AI překlad bývá bez přihlášení dostupný jen u prvních kapitol –
+                pokud web další kapitoly zamkne, stahování se zastaví a nabídne přihlášení nebo změnu překladu. Dostupnost překladů lze ověřit ve Stahování → Nastavení stahování.
+              </div>
+            </Card>
+          )}
 
           {errorBox}
 

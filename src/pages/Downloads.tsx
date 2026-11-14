@@ -7,6 +7,7 @@ import type { Project } from "@/types";
 import { Card, SectionTitle, Button, Badge, ProgressBar, Cover } from "@/components/ui";
 import { formatDateShort } from "@/lib/utils";
 import { projectStatus } from "@/services/status";
+import { DownloadControls } from "@/components/DownloadControls";
 import { Download, Pause, Play, RefreshCw, Trash2, Share2, FileText, Clock } from "lucide-react";
 
 export function Downloads() {
@@ -143,9 +144,10 @@ export function Downloads() {
                   {downloadManager.getCurrentChapter(p.id) && (
                     <div className="text-xs text-white/50 truncate">Aktuálně: {downloadManager.getCurrentChapter(p.id)!.title}</div>
                   )}
-                  {!running(p) && downloadManager.getLastError(p.id) && (
+                  {!running(p) && downloadManager.getLastError(p.id) && !p.accessMessage && (
                     <div className="text-xs text-red-400">{downloadManager.getLastError(p.id)}</div>
                   )}
+                  <DownloadControls project={p} running={running(p)} onChanged={load} />
 
                   <div className="flex flex-wrap gap-2 mt-3">
                     {running(p) ? (

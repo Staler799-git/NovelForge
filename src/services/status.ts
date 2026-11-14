@@ -7,7 +7,7 @@
  */
 import type { Project } from "@/types";
 
-export type StatusKey = "running" | "completed" | "failed" | "paused" | "interrupted" | "idle";
+export type StatusKey = "running" | "completed" | "failed" | "paused" | "interrupted" | "idle" | "waiting-auth" | "verification-required" | "rate-limited";
 
 export interface ProjectStatusView {
   key: StatusKey;
@@ -29,6 +29,12 @@ export function projectStatus(
       return { key: "failed", label: "Dokončeno s chybami", variant: "bad" };
     case "paused":
       return { key: "paused", label: "Pozastaveno", variant: "muted" };
+    case "waiting-auth":
+      return { key: "waiting-auth", label: "Čeká na přihlášení", variant: "warn" };
+    case "verification-required":
+      return { key: "verification-required", label: "Vyžadováno ověření", variant: "warn" };
+    case "rate-limited":
+      return { key: "rate-limited", label: "Omezeno webem", variant: "warn" };
     case "downloading":
       // v databázi zůstalo "downloading", ale nic neběží (aplikace byla ukončena)
       return { key: "interrupted", label: "Pozastaveno", variant: "muted" };
